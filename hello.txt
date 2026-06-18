@@ -1,2 +1,32 @@
 https://share.google/aimode/GZUDuNw3fyyITrvpS
 https://share.google/aimode/2l4u3eKwBcRETJX9x
+
+Phase 1:
+
+Estimating VaR (3 Methods):
+https://www.youtube.com/watch?v=2SMkbMDypXI
+
+Parametric Method to find VaR:
+https://www.youtube.com/watch?v=daX42dUtrJ0
+
+Historical Method to find VaR:
+https://www.youtube.com/watch?v=N-UcH4f-X9w
+
+Monte Carlo Method to find VaR:
+https://www.youtube.com/watch?v=q6qSwwpL26I
+
+VaR vs CVaR:
+https://www.youtube.com/watch?v=MrVJSizFJhs
+
+Phase 2:
+
+Wasserstein Distance:
+https://www.youtube.com/watch?v=2NQPzoRBn9I
+
+Wasserstein Distance and Optimal Transport:
+https://www.youtube.com/watch?v=88ONbF_b3VE
+
+
+
+
+ 

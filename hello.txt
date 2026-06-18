@@ -27,6 +27,9 @@ Wasserstein Distance and Optimal Transport:
 https://www.youtube.com/watch?v=88ONbF_b3VE
 
 
+Generative models, specifically Normalizing Flows. What a "fake-data generator" actually is mechanically, why we'll use a flow model rather than the flashier diffusion models (flows give you an exact, checkable likelihood, which makes our life much easier), and the core trick (change-of-variables) that makes them work.
+
+
 
 
  

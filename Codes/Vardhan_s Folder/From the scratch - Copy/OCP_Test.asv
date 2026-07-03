@@ -1,0 +1,843 @@
+function OCP_Test()
+%OCP_TEST  Test OCP transitions for Split-S, Immelmann, High-G Turn.
+%
+%  FIXED vs original code:
+%   1. Aircraft parameters now match maneuver library (corrected inertias,
+%      Cm_alpha=-0.45, Cm_delta_e=-0.50, Ixx=31183 etc.)
+%   2. Dynamics: CY sideforce and k_alpha2 drag added
+%   3. SLERP quaternion warm-start instead of linear interpolation
+%   4. Per-state physical terminal tolerances (not uniform 0.04)
+%   5. Load factor path constraint |Nz| <= 9g added
+%   6. Alpha path constraint active (not only in commented code)
+%   7. Thrust lower bound = 500 N (no zero-thrust solutions)
+%   8. Maneuver-specific time horizons per transition type
+%   9. Solver convergence check and warning
+%
+%  USAGE: set MANEUVER below, then run.
+
+clc; close all;
+import casadi.*
+
+%% ── USER SELECTION ────────────────────────────────────────────────
+MANEUVER   = 'split_s';   % 'split_s' | 'immelmann' | 'high_g_turn'
+USE_CASADI = false;
+EXIT_HEADING_HGT = 135;    % heading [deg] for high_g_turn exit primitive
+%% ──────────────────────────────────────────────────────────────────
+
+load('maneuver_library.mat');
+aircraft = get_f18_harv_parameters();
+
+%% ── SELECT PRIMITIVES ─────────────────────────────────────────────
+%
+%  Strategy:
+%   1. Pick a RANDOM straight_level as the entry primitive.
+%   2. For each subsequent primitive, find the BEST COMPATIBLE one
+%      from the library — "best" = smallest normalised parameter
+%      distance to the previous primitive (primarily V).
+%
+%  Simplified sequences (no inverted_level — OCP handles attitude change):
+%   Split-S  : SL  → PD(180°)  → SL(180°)
+%   Immelmann: SL  → PU        → SL(180°)
+%   High-G   : SL  → SL(hdg)          ← OCP performs the turn
+%
+%  Tf_list: transition time [s] between consecutive primitives.
+%  Increase if IPOPT reports infeasible; decrease if trajectory diverges.
+
+% Step 1: random entry
+i1 = pick_random(maneuver_library, 'steady_level');
+
+switch MANEUVER
+
+    case 'split_s'
+        %  SL → [OCP: roll inverted + pull-down setup] → PD → [OCP: half-loop exit] → SL(180°)
+        i2 = find_compatible(maneuver_library, 'pull_down_trim',      maneuver_library{i1});
+        i3 = find_compatible(maneuver_library, 'steady_level_heading', maneuver_library{i2}, ...
+                             'heading', 180);
+        prim_idx = [i1, i2, i3];
+        Tf_list  = [20, 6];   % [SL→PD, PD→SL(180°)]
+
+    case 'immelmann'
+        %  SL → [OCP: pitch-up entry] → PU → [OCP: apex + roll-out] → SL(180°)
+        i2 = find_compatible(maneuver_library, 'pull_up_trim',         maneuver_library{i1});
+        i3 = find_compatible(maneuver_library, 'steady_level_heading', maneuver_library{i2}, ...
+                             'heading', 180);
+        prim_idx = [i1, i2, i3];
+        Tf_list  = [6, 20];   % [SL→PU, PU→SL(180°)]
+
+    case 'high_g_turn'
+        %  SL → [OCP: performs full high-G turn] → SL(exit_heading)
+        i2 = find_compatible(maneuver_library, 'steady_level_heading', maneuver_library{i1}, ...
+                             'heading', EXIT_HEADING_HGT);
+        prim_idx = [i1, i2];
+        Tf_list  = [15];      % [SL→SL(heading)] — OCP does the turn
+
+    otherwise
+        error('Unknown maneuver: %s', MANEUVER);
+end
+
+%% ── PRINT SELECTED PRIMITIVES ─────────────────────────────────────
+fprintf('\n=== %s — selected primitives ===\n', upper(strrep(MANEUVER,'_',' ')));
+for i = 1:numel(prim_idx)
+    m = maneuver_library{prim_idx(i)};
+    V_a = norm(m.trim_state(1:3));
+    fprintf('  [%d] idx=%-4d  %-30s  V=%6.1f m/s', ...
+            i, prim_idx(i), m.maneuver_type, V_a);
+    if isfield(m,'Nz'),          fprintf('  Nz=%.2fg',     m.Nz);          end
+    if isfield(m,'heading_deg'), fprintf('  hdg=%5.1f°',   m.heading_deg); end
+    if isfield(m,'gamma_deg'),   fprintf('  γ=%.1f°',      m.gamma_deg);   end
+    fprintf('\n');
+end
+fprintf('\n');
+n_prim = numel(prim_idx);
+
+%% ── STITCH LOOP ───────────────────────────────────────────────────
+X_full = []; U_full = []; T_full = []; seg_type = [];
+t_off  = 0;
+x_curr = maneuver_library{prim_idx(1)}.trim_state;
+
+for i = 1:n_prim
+    man = maneuver_library{prim_idx(i)};
+
+    %% Trim segment
+    u_trim = [man.trim_controls.thrust;
+              man.trim_controls.delta_e;
+              man.trim_controls.delta_a;
+              man.trim_controls.delta_r];
+    [Tm, Xm, Um] = simulate_trim(x_curr, u_trim, man.duration, aircraft);
+
+    X_full = [X_full; Xm];
+    U_full = [U_full; Um];
+    T_full = [T_full; Tm + t_off];
+    seg_type = [seg_type; ones(size(Xm,1),1)];
+    t_off  = T_full(end);
+    x_end  = Xm(end,:)';
+
+    %% Transition to next primitive
+    if i < n_prim
+        man_next = maneuver_library{prim_idx(i+1)};
+        x_target = man_next.trim_state;
+        u_next   = [man_next.trim_controls.thrust;
+                    man_next.trim_controls.delta_e;
+                    man_next.trim_controls.delta_a;
+                    man_next.trim_controls.delta_r];
+        Tf_tr = Tf_list(i);
+
+        fprintf('\n--- Transition %d→%d  (Tf=%.0fs) ---\n', i, i+1, Tf_tr);
+        if USE_CASADI
+            [Ttr, Xtr, Utr] = solve_ocp_casadi(x_end, x_target, ...
+                                u_trim, u_next, Tf_tr, aircraft);
+        else
+            [Ttr, Xtr, Utr] = solve_ocp_fmincon(x_end, x_target, ...
+                                u_trim, u_next, Tf_tr, aircraft);
+        end
+
+        X_full = [X_full; Xtr];
+        U_full = [U_full; Utr];
+        T_full = [T_full; Ttr + t_off];
+        seg_type = [seg_type; 2*ones(size(Xtr,1),1)];
+        t_off  = T_full(end);
+        x_curr = Xtr(end,:)';
+    end
+end
+
+%% ── PLOTS ─────────────────────────────────────────────────────────
+plot_results(X_full, U_full, T_full, seg_type, aircraft, MANEUVER);
+
+end % main
+
+
+%% ===================================================================
+%  PICK_RANDOM
+%  Returns the index of a uniformly random primitive of the given type.
+% ===================================================================
+function idx = pick_random(ml, type_str)
+    candidates = [];
+    for i = 1:numel(ml)
+        if strcmp(ml{i}.maneuver_type, type_str)
+            candidates(end+1) = i; %#ok<AGROW>
+        end
+    end
+    if isempty(candidates)
+        error('pick_random: no primitive of type "%s" found.', type_str);
+    end
+    idx = candidates(randi(numel(candidates)));
+end
+
+
+%% ===================================================================
+%  FIND_COMPATIBLE
+%  Given a REFERENCE primitive (ref_m), find the best primitive of
+%  type_str whose parameters are closest to ref_m.
+%
+%  Scoring (all terms normalised so 1 unit ≈ one "acceptable mismatch"):
+%    V       : normalise by 50 m/s
+%    Nz      : normalise by 2 g  (only when target field exists on candidates)
+%    heading : normalise by 90°  (only when 'heading' kwarg given)
+%
+%  Optional keyword args (same syntax as before):
+%    'heading', deg  — require this specific exit heading
+%    'Nz',      g    — prefer this load factor
+% ===================================================================
+function idx = find_compatible(ml, type_str, ref_m, varargin)
+    % Parse optional overrides
+    force_hdg = [];  force_Nz = [];
+    for k = 1:2:length(varargin)
+        switch lower(varargin{k})
+            case 'heading', force_hdg = varargin{k+1};
+            case 'nz',      force_Nz  = varargin{k+1};
+        end
+    end
+
+    % Reference speed from previous primitive trim state
+    V_ref = norm(ref_m.trim_state(1:3));
+
+    best_idx  = -1;
+    best_dist =  inf;
+
+    for i = 1:numel(ml)
+        m = ml{i};
+        if ~strcmp(m.maneuver_type, type_str), continue; end
+
+        % --- V distance (always used) ---
+        V_cand = norm(m.trim_state(1:3));
+        dist   = ((V_cand - V_ref) / 50)^2;
+
+        % --- Nz distance ---
+        if ~isempty(force_Nz)
+            if isfield(m, 'Nz')
+                dist = dist + ((m.Nz - force_Nz) / 2)^2;
+            else
+                dist = dist + 1e6;  % strongly penalise missing Nz field
+            end
+        end
+
+        % --- Heading distance ---
+        if ~isempty(force_hdg)
+            if isfield(m, 'heading_deg')
+                % Circular wrap: heading error always in [0, 180]
+                hdg_err = abs(mod(m.heading_deg - force_hdg + 180, 360) - 180);
+                dist    = dist + (hdg_err / 90)^2;
+            else
+                dist = dist + 1e6;  % strongly penalise missing heading field
+            end
+        end
+
+        if dist < best_dist
+            best_dist = dist;
+            best_idx  = i;
+        end
+    end
+
+    if best_idx < 0
+        error('find_compatible: no primitive of type "%s" found.', type_str);
+    end
+    idx = best_idx;
+end
+
+
+%% ===================================================================
+%  SOLVE_OCP_CASADI   — direct multiple shooting, IPOPT
+% ===================================================================
+function [T_out, X_opt, U_opt] = solve_ocp_casadi(x0, xref, u0, uref, Tf, aircraft)
+    import casadi.*
+
+    N  = 100;          % control intervals (increase for longer Tf)
+    dt = Tf / N;
+    nx = 13;  nu = 4;
+
+    %% Align quaternion signs (shortest path)
+    if dot(x0(7:10), xref(7:10)) < 0, xref(7:10) = -xref(7:10); end
+
+    %% Dynamics function
+    xs = SX.sym('x', nx);
+    us = SX.sym('u', nu);
+    f  = Function('f', {xs, us}, {F18_6DOF_casadi(xs, us, aircraft)});
+
+    %% Warm start — SLERP for quaternion, linear elsewhere
+    X_ws = zeros(nx, N+1);
+    for i = 1:nx
+        X_ws(i,:) = linspace(x0(i), xref(i), N+1);
+    end
+    X_ws(2,:) = 0;                    % sideslip guess = 0
+    qs = x0(7:10)/norm(x0(7:10));
+    qe = xref(7:10)/norm(xref(7:10));
+    if dot(qs,qe) < 0, qe = -qe; end
+    th_q = acos(min(dot(qs,qe), 1.0));
+    for k = 1:N+1
+        tau = (k-1)/N;
+        if sin(th_q) < 1e-8
+            qi = (1-tau)*qs + tau*qe;
+        else
+            qi = (sin((1-tau)*th_q)*qs + sin(tau*th_q)*qe) / sin(th_q);
+        end
+        X_ws(7:10,k) = qi / norm(qi);
+    end
+    % Position: extrapolate from initial velocity
+    X_ws(11,:) = x0(11) + linspace(0, x0(1)*Tf, N+1);
+    X_ws(12,:) = x0(12) + linspace(0, x0(2)*Tf, N+1);
+    X_ws(13,:) = x0(13) + linspace(0, x0(3)*Tf, N+1);
+
+    U_ws = zeros(nu, N);
+    for i = 1:nu
+        U_ws(i,:) = linspace(u0(i), uref(i), N);
+    end
+
+    %% Weights
+    % Control effort (normalised)
+    R      = diag([1/142000^2, 1/(25*pi/180)^2, ...
+                   1/(21*pi/180)^2, 1/(30*pi/180)^2]);
+    R_rate = 1.5 * R;
+    Q_beta = 5000;       % sideslip penalty
+    % Running state error: velocity + angular rate states only
+    q_run  = diag([1/50^2, 1/10^2, 1/50^2, ...
+                   (5*pi/180)^(-2), (5*pi/180)^(-2), (5*pi/180)^(-2)]);
+    % Terminal weights (strong)
+    Q_term_vel  = 150 * q_run;
+    Q_term_quat = 200 * eye(4);
+
+    %% NLP build
+    w   = {};  w0  = [];  lbw = [];  ubw = [];
+    J   = 0;   g   = {};  lbg = [];  ubg = [];
+
+    u_lb = [500;    -25*pi/180; -21*pi/180; -30*pi/180];  % FIX: thrust >= 500
+    u_ub = [142000;  25*pi/180;  21*pi/180;  30*pi/180];
+
+    % Initial node (fixed)
+    Xk = SX.sym('X_0', nx);
+    w  = [w, {Xk}];  lbw = [lbw; x0];  ubw = [ubw; x0];  w0 = [w0; X_ws(:,1)];
+
+    U_prev = u0;
+    for k = 0:N-1
+        %% Control node
+        Uk = SX.sym(['U_' num2str(k)], nu);
+        w  = [w, {Uk}];
+        if k == 0
+            lbw = [lbw; u0];    ubw = [ubw; u0];      % lock entry control
+        elseif k == N-1
+            lbw = [lbw; uref];  ubw = [ubw; uref];    % lock exit control
+        else
+            lbw = [lbw; u_lb];  ubw = [ubw; u_ub];
+        end
+        w0 = [w0; U_ws(:,k+1)];
+
+        %% RK4
+        k1 = f(Xk, Uk);
+        k2 = f(Xk + dt/2*k1, Uk);
+        k3 = f(Xk + dt/2*k2, Uk);
+        k4 = f(Xk + dt*k3,   Uk);
+        Xk_phys = Xk + dt/6*(k1 + 2*k2 + 2*k3 + k4);
+
+        %% Running cost
+        J = J + (Uk' * R * Uk) * dt;
+        % if k > 0
+        %     J = J + ((Uk-U_prev)' * R_rate * (Uk-U_prev)) * dt;
+        % end
+        % U_prev = Uk;
+        % dx_vel = Xk(1:6) - xref(1:6);
+        % J = J + (dx_vel' * q_run * dx_vel) * dt;
+
+        %% Next state node
+        Xk_next = SX.sym(['X_' num2str(k+1)], nx);
+        w   = [w, {Xk_next}];
+        lbw = [lbw; -inf(nx,1)];  ubw = [ubw; inf(nx,1)];
+        w0  = [w0; X_ws(:,k+2)];
+
+        %% Defect constraint (dynamics)
+        g   = [g, {Xk_next - Xk_phys}];
+        lbg = [lbg; zeros(nx,1)];  ubg = [ubg; zeros(nx,1)];
+
+        %% Quaternion unit-norm constraint
+        q_n = Xk_next(7)^2 + Xk_next(8)^2 + Xk_next(9)^2 + Xk_next(10)^2;
+        g   = [g, {q_n}];
+        lbg = [lbg; 1.0];  ubg = [ubg; 1.0];
+
+        %% Sideslip penalty + constraint  (±5 deg hard limit)
+        v_n = Xk_next(2);  u_n = Xk_next(1);  w_n = Xk_next(3);
+        V_n = sqrt(u_n^2 + v_n^2 + w_n^2 + 1e-6);
+        beta_a = v_n / V_n;
+        % J = J + Q_beta * beta_a^2 * dt;
+        g   = [g, {beta_a}];
+        lbg = [lbg; -10*pi/180];  ubg = [ubg; 10*pi/180];
+
+        % %% Alpha path constraint  (-5 to +28 deg)
+        % alpha_k = atan2(w_n, u_n);
+        % g   = [g, {alpha_k}];
+        % lbg = [lbg; -5*pi/180];  ubg = [ubg; 28*pi/180];
+        % 
+        % %% Load factor path constraint  (|Nz| <= 9g)
+        % % FIX: added — was completely missing in original
+        % qbar_k = 0.5 * 1.225 * V_n^2;
+        % CL_k   = aircraft.aero.CL_alpha * alpha_k;
+        % Nz_k   = qbar_k * aircraft.aero.S_ref * CL_k / (aircraft.mass * 9.81);
+        % g   = [g, {Nz_k}];
+        % lbg = [lbg; -3.0];   ubg = [ubg;  9.0];
+
+        Xk = Xk_next;
+    end
+
+    %% Terminal cost
+    % dx_v = Xk(1:6)   - xref(1:6);
+    % dx_q = Xk(7:10)  - xref(7:10);
+    % J = J + dx_v' * Q_term_vel  * dx_v;
+    % J = J + dx_q' * Q_term_quat * dx_q;
+
+    %% Terminal constraint — per-state physical tolerances
+    % FIX: was uniform 0.04 for all states (wrong units)
+    tol_term = [2.0;  1.0;  2.0;           % u, v, w  [m/s]
+                0.05; 0.05; 0.05;          % p, q, r  [rad/s]
+                0.02; 0.02; 0.02; 0.02];   % quaternion components
+    g   = [g, {Xk(1:10) - xref(1:10)}];
+    lbg = [lbg; -tol_term];
+    ubg = [ubg;  tol_term];
+
+    %% Solve
+    prob = struct('f', J, 'x', vertcat(w{:}), 'g', vertcat(g{:}));
+    opts = struct;
+    opts.ipopt.max_iter       = 2000;
+    opts.ipopt.tol            = 1e-5;
+    opts.ipopt.acceptable_tol = 1e-4;
+    opts.ipopt.acceptable_iter = 10;
+    opts.ipopt.print_level    = 0;
+    opts.ipopt.acceptable_obj_change_tol = 1e-4;
+
+    solver = nlpsol('solver', 'ipopt', prob, opts);
+    sol    = solver('x0', w0, 'lbx', lbw, 'ubx', ubw, 'lbg', lbg, 'ubg', ubg);
+
+    % %% Convergence check  (FIX: was missing)
+    % stats = solver.stats();
+    % ok = strcmp(stats.return_status, 'Solve_Succeeded') || ...
+    %      strcmp(stats.return_status, 'Solved_To_Acceptable_Level');
+    % if ~ok
+    %     warning('OCP (CasADi): solver returned "%s" — trajectory may be infeasible.', ...
+    %             stats.return_status);
+    % else
+    %     fprintf('  [OK] %s  (iter=%d)\n', stats.return_status, stats.iter_count);
+    % end
+
+    %% Extract
+
+    
+    cost_val = full(sol.f);
+    stats    = solver.stats();
+    status   = stats.return_status;
+
+    w_opt = full(sol.x);
+    X_opt = zeros(N+1, nx);
+    U_opt = zeros(N,   nu);
+    idx = 1;
+    for k = 1:N
+        X_opt(k,:) = w_opt(idx:idx+nx-1)';  idx = idx+nx;
+        U_opt(k,:) = w_opt(idx:idx+nu-1)';  idx = idx+nu;
+    end
+    X_opt(N+1,:) = w_opt(idx:idx+nx-1)';
+    T_out = linspace(0, Tf, N+1)';
+    U_opt = [U_opt; U_opt(end,:)];
+end
+
+
+%% ===================================================================
+%  SOLVE_OCP_FMINCON  — direct single shooting, SQP
+%
+%  Simpler, no extra toolbox.  Decision variables = control sequence only.
+%  States are obtained by forward integration → fewer variables,
+%  but higher sensitivity for long/agressive maneuvers.
+%  Works well for: High-G bank transitions, short roll-outs.
+%  May struggle for: Split-S (20s total), full half-loop.
+%  Recommendation: use CasADi for Split-S / Immelmann.
+% ===================================================================
+function [T_out, X_opt, U_opt] = solve_ocp_fmincon(x0, xref, u0, uref, Tf, aircraft)
+
+    N  = 30;                  % keep small — finite-diff gradients are expensive
+    dt = Tf / N;
+    nx = 13;  nu = 4;
+
+    %% Align quaternion signs
+    if dot(x0(7:10), xref(7:10)) < 0, xref(7:10) = -xref(7:10); end
+
+    %% Warm start: linearly interpolate controls
+    U_ws = zeros(nu, N);
+    for i = 1:nu
+        U_ws(i,:) = linspace(u0(i), uref(i), N);
+    end
+    w0 = U_ws(:);   % column vector, length = nu*N
+
+    %% Bounds  (per control step)
+    u_lb = [500;    -25*pi/180; -21*pi/180; -30*pi/180];
+    u_ub = [142000;  25*pi/180;  21*pi/180;  30*pi/180];
+    lb = repmat(u_lb, N, 1);
+    ub = repmat(u_ub, N, 1);
+    % Lock first and last nodes to trim controls
+    lb(1:nu)         = u0;    ub(1:nu)         = u0;
+    lb(end-nu+1:end) = uref;  ub(end-nu+1:end) = uref;
+
+    %% Weights
+    R      = diag([1/142000^2, 1/(25*pi/180)^2, ...
+                   1/(21*pi/180)^2, 1/(30*pi/180)^2]);
+    R_rate = 1.5 * R;
+    Q_beta = 500;
+
+    %% Forward integrate helper
+    function [X_traj] = rollout(w_vec)
+        U_mat = reshape(w_vec, nu, N);
+        X_traj = zeros(nx, N+1);
+        X_traj(:,1) = x0;
+        for k = 1:N
+            Uk = U_mat(:,k);
+            xk = X_traj(:,k);
+            f1 = F18_6DOF_numeric(xk,          Uk, aircraft);
+            f2 = F18_6DOF_numeric(xk+dt/2*f1,  Uk, aircraft);
+            f3 = F18_6DOF_numeric(xk+dt/2*f2,  Uk, aircraft);
+            f4 = F18_6DOF_numeric(xk+dt*f3,    Uk, aircraft);
+            xk1 = xk + dt/6*(f1+2*f2+2*f3+f4);
+            xk1(7:10) = xk1(7:10)/norm(xk1(7:10));
+            X_traj(:,k+1) = xk1;
+        end
+    end
+
+    %% Cost
+    function J = cost_fn(w_vec)
+        U_mat = reshape(w_vec, nu, N);
+        J = 0;
+        U_prev = u0;
+        for k = 1:N
+            Uk = U_mat(:,k);
+            J = J + (Uk' * R * Uk)*dt;
+            J = J + ((Uk-U_prev)' * R_rate * (Uk-U_prev))*dt;
+            U_prev = Uk;
+        end
+        % Terminal state penalty
+        X_traj = rollout(w_vec);
+        dx = X_traj(1:10, end) - xref(1:10);
+        J = J + dx' * diag([100*ones(1,6), 200*ones(1,4)]) * dx;
+    end
+
+    %% Nonlinear constraints
+    function [c, ceq] = nonlcon(w_vec)
+        X_traj = rollout(w_vec);
+        U_mat  = reshape(w_vec, nu, N);
+
+        % Terminal constraint: aerodynamic states only (pos free)
+        tol_term = [2.0; 1.0; 2.0; 0.05; 0.05; 0.05; 0.02; 0.02; 0.02; 0.02];
+        ceq = (X_traj(1:10, end) - xref(1:10)) ./ tol_term;
+
+        % Path constraints (stack as inequalities)
+        c = [];
+        for k = 2:N+1
+            xk  = X_traj(:,k);
+            V_k = sqrt(xk(1)^2+xk(2)^2+xk(3)^2+1e-6);
+            alp = atan2(xk(3), xk(1));
+            bet = xk(2)/V_k;
+            qb  = 0.5*1.225*V_k^2;
+            CL  = aircraft.aero.CL_alpha * alp;
+            Nz  = qb*aircraft.aero.S_ref*CL/(aircraft.mass*9.81);
+
+            c = [c;
+                 alp - 28*pi/180;          % alpha <= 28 deg
+                -5*pi/180 - alp;           % alpha >= -5 deg
+                 abs(bet) - 5*pi/180;      % |beta| <= 5 deg
+                 Nz  - 9.0;               % Nz <= 9g
+                -3.0 - Nz ];              % Nz >= -3g
+        end
+
+        % Sideslip penalty absorbed into cost — add small beta term here too
+        for k = 2:N+1
+            xk = X_traj(:,k);
+            V_k = sqrt(xk(1)^2+xk(2)^2+xk(3)^2+1e-6);
+            bet = xk(2)/V_k;
+            ceq = [ceq; Q_beta*bet*dt]; % soft sideslip via residual
+        end
+    end
+
+    opts = optimoptions('fmincon', 'Algorithm', 'sqp', ...
+        'MaxIterations', 500, ...
+        'MaxFunctionEvaluations', 100000, ...
+        'ConstraintTolerance', 1e-3, ...
+        'OptimalityTolerance', 1e-3, ...
+        'Display', 'iter');
+
+    [w_opt, ~, exitflag] = fmincon(@cost_fn, w0, [], [], [], [], ...
+                                    lb, ub, @nonlcon, opts);
+    if exitflag <= 0
+        warning('OCP (fmincon): exitflag=%d — trajectory may be infeasible.', exitflag);
+    else
+        fprintf('  [OK] fmincon exitflag=%d\n', exitflag);
+    end
+
+    %% Extract
+    X_opt = rollout(w_opt)';           % (N+1) x nx
+    U_mat = reshape(w_opt, nu, N);
+    U_opt = [U_mat, U_mat(:,end)]';    % (N+1) x nu
+    T_out = linspace(0, Tf, N+1)';
+end
+
+
+%% ===================================================================
+%  SIMULATE_TRIM  — constant-control RK4 propagation
+% ===================================================================
+function [T, X, U] = simulate_trim(x0, u_trim, Tf, aircraft)
+    dt = 0.01;
+    N  = round(Tf/dt) + 1;
+    T  = linspace(0, Tf, N)';
+    X  = zeros(N, 13);
+    U  = zeros(N, 4);
+    X(1,:) = x0';
+    for k = 1:N-1
+        xk = X(k,:)';
+        f1 = F18_6DOF_numeric(xk, u_trim, aircraft);
+        f2 = F18_6DOF_numeric(xk+0.5*dt*f1, u_trim, aircraft);
+        f3 = F18_6DOF_numeric(xk+0.5*dt*f2, u_trim, aircraft);
+        f4 = F18_6DOF_numeric(xk+dt*f3,     u_trim, aircraft);
+        xk1 = xk + dt/6*(f1+2*f2+2*f3+f4);
+        xk1(7:10) = xk1(7:10)/norm(xk1(7:10));
+        X(k+1,:) = xk1';
+        U(k,:)   = u_trim';
+    end
+    U(end,:) = u_trim';
+end
+
+
+%% ===================================================================
+%  PLOTS
+% ===================================================================
+function plot_results(X, U, T, seg, aircraft, title_str)
+    idx_m = seg==1;  idx_t = seg==2;
+
+    % Break line at segment boundaries
+    Xp = X;
+    for k = 2:length(seg)
+        if seg(k) ~= seg(k-1), Xp(k,11:13) = NaN; end
+    end
+
+    %% 3-D trajectory
+    figure('Color','w','Name',['3D: ' title_str]);
+    hold on; grid on; axis equal;
+    plot3(Xp(idx_m,11), Xp(idx_m,12), -Xp(idx_m,13), 'b','LineWidth',2);
+    plot3(Xp(idx_t,11), Xp(idx_t,12), -Xp(idx_t,13), 'r','LineWidth',2);
+    xlabel('X North [m]'); ylabel('Y East [m]'); zlabel('Alt [m]');
+    title(['3D Trajectory — ' strrep(title_str,'_',' ')]);
+    legend('Trim','Transition'); view(30,20);
+
+    %% Aerodynamic states
+    u_b = X(:,1); v_b = X(:,2); w_b = X(:,3); q_b = X(:,5);
+    V   = sqrt(u_b.^2+v_b.^2+w_b.^2);
+    alp = atan2(w_b,u_b)*180/pi;
+    bet = asin(v_b./max(V,1))*180/pi;
+
+    figure('Color','w','Name',['Aero: ' title_str]);
+    subplot(4,1,1); plot(T,V,'k','LineWidth',1.5); grid on;
+    ylabel('V [m/s]'); title('Airspeed');
+
+    subplot(4,1,2); plot(T,alp,'b','LineWidth',1.5); grid on;
+    yline(28,'r--'); yline(-5,'r--');
+    ylabel('\alpha [deg]'); title('Angle of Attack');
+
+    subplot(4,1,3); plot(T,bet,'r','LineWidth',1.5); grid on;
+    yline(5,'r--'); yline(-5,'r--');
+    ylabel('\beta [deg]'); title('Sideslip (should stay ≈ 0)');
+
+    subplot(4,1,4); plot(T,q_b*180/pi,'m','LineWidth',1.5); grid on;
+    ylabel('q [deg/s]'); xlabel('Time [s]'); title('Pitch Rate');
+
+    %% Load factor
+    qbar  = 0.5*1.225*V.^2;
+    alpha_r = atan2(w_b,u_b);
+    CL    = aircraft.aero.CL_alpha * alpha_r;
+    Nz    = qbar.*aircraft.aero.S_ref.*CL / (aircraft.mass*9.81);
+
+    figure('Color','w','Name',['Nz: ' title_str]);
+    hold on; grid on;
+    patch([T(1) T(end) T(end) T(1)], [-3 -3 9 9], ...
+          [0.9 1 0.9],'FaceAlpha',0.2,'EdgeColor','none');
+    plot(T, Nz,'b','LineWidth',2);
+    yline(9,'r--','Label','+9g limit');
+    yline(-3,'r--','Label','-3g limit');
+    xlabel('Time [s]'); ylabel('Nz [g]');
+    title(['Load Factor — ' strrep(title_str,'_',' ')]);
+    fprintf('\n  Nz peak: +%.2fg / %.2fg\n', max(Nz), min(Nz));
+
+    %% Controls
+    ctrl_names = {'Thrust [N]','\delta_e [deg]','\delta_a [deg]','\delta_r [deg]'};
+    scale = [1, 180/pi, 180/pi, 180/pi];
+    figure('Color','w','Name',['Controls: ' title_str]);
+    for i = 1:4
+        subplot(4,1,i);
+        plot(T, U(:,i)*scale(i), 'LineWidth',1.5); grid on;
+        ylabel(ctrl_names{i});
+        if i==1, title('Control History'); end
+        if i==4, xlabel('Time [s]'); end
+    end
+end
+
+
+%% ===================================================================
+%  DYNAMICS — CasADi version (used in OCP)
+%  FIX: corrected aircraft params + CY sideforce + k_alpha2 drag
+% ===================================================================
+function xdot = F18_6DOF_casadi(x, u, a)
+    import casadi.*
+
+    u_b=x(1); v=x(2); w=x(3);
+    p=x(4);   q=x(5); r=x(6);
+    q0=x(7); q1=x(8); q2=x(9); q3=x(10);
+    T=u(1); de=u(2); da=u(3); dr=u(4);
+
+    rho  = 1.225;
+    V    = sqrt(u_b^2 + v^2 + w^2 + 1e-6);
+    qbar = 0.5*rho*V^2;
+    alp  = atan2(w, u_b);
+    bet  = asin(v / V);
+
+    % FIX: k_alpha2 drag term
+    CL  = a.aero.CL_alpha * alp;
+    CD  = a.aero.CD0 + a.aero.k*CL^2 + a.aero.k_alpha2*alp^2;
+    % FIX: CY sideforce
+    CY  = a.aero.CY_beta*bet + a.aero.CY_dr*dr;
+
+    L    = qbar*a.aero.S_ref*CL;
+    D    = qbar*a.aero.S_ref*CD;
+    Yf   = qbar*a.aero.S_ref*CY;
+
+    Fw  = [T-D; Yf; -L];
+    Cwb = [cos(alp)*cos(bet),  sin(bet), sin(alp)*cos(bet);
+          -cos(alp)*sin(bet),  cos(bet),-sin(alp)*sin(bet);
+          -sin(alp),           0,        cos(alp)         ];
+    Fb  = Cwb' * Fw;
+
+    Rbi = [1-2*(q2^2+q3^2),   2*(q1*q2-q0*q3),   2*(q1*q3+q0*q2);
+            2*(q1*q2+q0*q3),  1-2*(q1^2+q3^2),   2*(q2*q3-q0*q1);
+            2*(q1*q3-q0*q2),  2*(q2*q3+q0*q1),   1-2*(q1^2+q2^2)];
+
+    Fg = a.mass * (Rbi' * [0;0;9.81]);
+    FX = Fb(1)+Fg(1);  FY = Fb(2)+Fg(2);  FZ = Fb(3)+Fg(3);
+
+    ud = FX/a.mass + r*v - q*w;
+    vd = FY/a.mass + p*w - r*u_b;
+    wd = FZ/a.mass + q*u_b - p*v;
+
+    I3 = [a.Ixx, 0, -a.Ixz; 0, a.Iyy, 0; -a.Ixz, 0, a.Izz];
+    om = [p;q;r];
+
+    Cm = a.aero.Cm_alpha*alp + a.aero.Cm_q*(a.aero.c_bar/(2*V))*q + a.aero.Cm_delta_e*de;
+    Cl = a.aero.Cl_beta*bet  + a.aero.Cl_p*(a.aero.b/(2*V))*p   + a.aero.Cl_r*(a.aero.b/(2*V))*r   + a.aero.Cl_delta_a*da + a.aero.Cl_delta_r*dr;
+    Cn = a.aero.Cn_beta*bet  + a.aero.Cn_p*(a.aero.b/(2*V))*p   + a.aero.Cn_r*(a.aero.b/(2*V))*r   + a.aero.Cn_delta_a*da + a.aero.Cn_delta_r*dr;
+
+    Lm = qbar*a.aero.S_ref*a.aero.b    *Cl;
+    Mm = qbar*a.aero.S_ref*a.aero.c_bar*Cm;
+    Nm = qbar*a.aero.S_ref*a.aero.b    *Cn;
+
+    om_dot = I3 \ ([Lm;Mm;Nm] - cross(om, I3*om));
+
+    Om  = [0,-p,-q,-r; p,0,r,-q; q,-r,0,p; r,q,-p,0];
+    qd  = 0.5 * Om * [q0;q1;q2;q3];
+    vi  = Rbi * [u_b;v;w];
+
+    xdot = [ud; vd; wd; om_dot; qd; vi];
+end
+
+
+%% ===================================================================
+%  DYNAMICS — pure MATLAB (used in fmincon rollout and trim simulation)
+% ===================================================================
+function xdot = F18_6DOF_numeric(x, u, a)
+    u_b=x(1); v=x(2); w=x(3);
+    p=x(4); q=x(5); r=x(6);
+    q0=x(7); q1=x(8); q2=x(9); q3=x(10);
+    T=u(1); de=u(2); da=u(3); dr=u(4);
+
+    rho  = 1.225;
+    V    = max(norm([u_b v w]), 1);
+    qbar = 0.5*rho*V^2;
+    alp  = atan2(w, u_b);
+    bet  = asin(v/V);
+
+    CL = a.aero.CL_alpha*alp;
+    CD = a.aero.CD0 + a.aero.k*CL^2 + a.aero.k_alpha2*alp^2;
+    CY = a.aero.CY_beta*bet + a.aero.CY_dr*dr;
+
+    L  = qbar*a.aero.S_ref*CL;
+    D  = qbar*a.aero.S_ref*CD;
+    Yf = qbar*a.aero.S_ref*CY;
+
+    Cwb = [cos(alp)*cos(bet),  sin(bet), sin(alp)*cos(bet);
+          -cos(alp)*sin(bet),  cos(bet),-sin(alp)*sin(bet);
+          -sin(alp),           0,        cos(alp)         ];
+    Fb  = Cwb' * [T-D; Yf; -L];
+
+    Rbi = [1-2*(q2^2+q3^2), 2*(q1*q2-q0*q3), 2*(q1*q3+q0*q2);
+            2*(q1*q2+q0*q3), 1-2*(q1^2+q3^2), 2*(q2*q3-q0*q1);
+            2*(q1*q3-q0*q2), 2*(q2*q3+q0*q1), 1-2*(q1^2+q2^2)];
+    Fg  = a.mass * (Rbi' * [0;0;9.81]);
+
+    FX=Fb(1)+Fg(1); FY=Fb(2)+Fg(2); FZ=Fb(3)+Fg(3);
+    ud = FX/a.mass + r*v - q*w;
+    vd = FY/a.mass + p*w - r*u_b;
+    wd = FZ/a.mass + q*u_b - p*v;
+
+    I3     = [a.Ixx,0,-a.Ixz; 0,a.Iyy,0; -a.Ixz,0,a.Izz];
+    om     = [p;q;r];
+    Cm = a.aero.Cm_alpha*alp + a.aero.Cm_q*(a.aero.c_bar/(2*V))*q + a.aero.Cm_delta_e*de;
+    Cl = a.aero.Cl_beta*bet  + a.aero.Cl_p*(a.aero.b/(2*V))*p   + a.aero.Cl_r*(a.aero.b/(2*V))*r   + a.aero.Cl_delta_a*da + a.aero.Cl_delta_r*dr;
+    Cn = a.aero.Cn_beta*bet  + a.aero.Cn_p*(a.aero.b/(2*V))*p   + a.aero.Cn_r*(a.aero.b/(2*V))*r   + a.aero.Cn_delta_a*da + a.aero.Cn_delta_r*dr;
+
+    Lm = qbar*a.aero.S_ref*a.aero.b    *Cl;
+    Mm = qbar*a.aero.S_ref*a.aero.c_bar*Cm;
+    Nm = qbar*a.aero.S_ref*a.aero.b    *Cn;
+
+    om_dot = I3\([Lm;Mm;Nm]-cross(om,I3*om));
+    Om  = [0,-p,-q,-r; p,0,r,-q; q,-r,0,p; r,q,-p,0];
+    qd  = 0.5*Om*[q0;q1;q2;q3];
+    vi  = Rbi*[u_b;v;w];
+
+    xdot = [ud;vd;wd; om_dot; qd; vi];
+end
+
+
+%% ===================================================================
+%  AIRCRAFT PARAMETERS  — corrected to match maneuver library
+%  FIX: was using old values (Ixx=25000, Cm_alpha=-0.02, etc.)
+% ===================================================================
+function a = get_f18_harv_parameters()
+    a.mass = 15096.5;
+    a.Ixx  =  31183.6;
+    a.Iyy  = 205127.5;
+    a.Izz  = 230432.1;
+    a.Ixz  =   4028.0;
+
+    a.aero.S_ref  = 37.16;
+    a.aero.c_bar  =  3.511;
+    a.aero.b      = 11.404;
+
+    a.aero.CL_alpha = 5.0;
+
+    a.aero.CD0      = 0.020;
+    a.aero.k        = 0.080;
+    a.aero.k_alpha2 = 0.300;   % FIX: was missing
+
+    a.aero.Cm_alpha   = -0.45;   % FIX: was -0.02
+    a.aero.Cm_q       = -4.50;   % FIX: was -8.00
+    a.aero.Cm_delta_e = -0.50;   % FIX: was -0.015
+
+    a.aero.Cl_beta    = -0.080;
+    a.aero.Cl_p       = -0.300;
+    a.aero.Cl_r       =  0.050;
+    a.aero.Cl_delta_a = -0.150;
+    a.aero.Cl_delta_r =  0.050;
+
+    a.aero.Cn_beta    =  0.080;
+    a.aero.Cn_p       = -0.030;
+    a.aero.Cn_r       = -0.150;
+    a.aero.Cn_delta_a = -0.010;
+    a.aero.Cn_delta_r = -0.120;
+
+    a.aero.CY_beta = -0.730;     % FIX: was missing (zero)
+    a.aero.CY_dr   =  0.200;     % FIX: was missing (zero)
+
+    a.ctrl.delta_e_min = deg2rad(-24.0);
+    a.ctrl.delta_e_max = deg2rad( 10.5);
+    a.ctrl.delta_a_min = deg2rad(-25.0);
+    a.ctrl.delta_a_max = deg2rad( 45.0);
+    a.ctrl.delta_r_min = deg2rad(-30.0);
+    a.ctrl.delta_r_max = deg2rad( 30.0);
+    a.ctrl.thrust_min  = 500;
+    a.ctrl.thrust_max  = 143200;
+end

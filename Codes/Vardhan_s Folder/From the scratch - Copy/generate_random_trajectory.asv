@@ -1,0 +1,387 @@
+function generate_random_trajectory()
+%GENERATE_RANDOM_TRAJECTORY
+%  Builds a random feasible trajectory by walking the primitive graph using
+%  the precomputed transition_library.
+%
+%  Graph walk logic:
+%    1. Pick a random starting primitive (straight_level only — clean entry)
+%    2. Find all j where transition_library(i,j) is feasible
+%    3. Randomly select next primitive j (weighted by inverse cost — cheaper
+%       transitions are preferred, but all feasible ones are reachable)
+%    4. Stitch: trim_i → transition_i→j → trim_j
+%    5. Set i = j, repeat until n_segments reached or dead end
+%
+%  Position continuity:
+%    Stored transitions begin at the trim_state position (near origin).
+%    At each stitch point, a position OFFSET is computed and added to all
+%    position rows (11,12,13) of the appended segment so the trajectory is
+%    spatially continuous.
+%
+%  Feasibility definition (user-configurable):
+%    ACCEPT_ACCEPTABLE_LEVEL = true  →  "Solved_To_Acceptable_Level" counts
+%    ACCEPT_ACCEPTABLE_LEVEL = false →  only "Solve_Succeeded" counts
+
+clc; close all;
+
+%% ── CONFIG ────────────────────────────────────────────────────────────────
+N_SEGMENTS           = ;      % number of trim primitives to chain
+TRIM_DURATION        = 10.0;    % [s] how long to hold each trim primitive
+DT_SIM               = 0.01;   % [s] re-simulation timestep
+ACCEPT_ACCEPTABLE    = true;   % count "Solved_To_Acceptable_Level" as feasible
+ENTRY_TYPE           = 'climbing_right_turn';   % type of the first primitive
+WEIGHT_BY_COST       = false;   % if true: weight next-primitive selection
+                                %   by 1/cost (cheaper = more likely)
+%% ──────────────────────────────────────────────────────────────────────────
+
+fprintf('Loading libraries...\n');
+load('maneuver_library.mat',   'maneuver_library');
+load('transition_library.mat', 'transition_library');
+aircraft = get_f18_harv_parameters();
+
+N_prim = length(maneuver_library);
+fprintf('  %d primitives,  %dx%d transition grid.\n\n', ...
+        N_prim, N_prim, N_prim);
+
+%% ── BUILD ADJACENCY LIST ──────────────────────────────────────────────────
+% adj{i} = list of j indices reachable from i
+fprintf('Building adjacency list...\n');
+adj      = cell(N_prim, 1);
+adj_cost = cell(N_prim, 1);
+
+for i = 1:N_prim
+    nbrs  = [];
+    costs = [];
+    for j = 1:N_prim
+        if i == j, continue; end
+        entry = transition_library(i,j);
+        if is_feasible(entry, ACCEPT_ACCEPTABLE)
+            nbrs(end+1)  = j;          %#ok<AGROW>
+            costs(end+1) = entry.cost; %#ok<AGROW>
+        end
+    end
+    adj{i}      = nbrs;
+    adj_cost{i} = costs;
+end
+
+n_edges = sum(cellfun(@numel, adj));
+fprintf('  %d feasible directed edges in graph.\n\n', n_edges);
+
+%% ── PICK STARTING PRIMITIVE ───────────────────────────────────────────────
+entry_indices = find(cellfun(@(m) strcmp(m.maneuver_type, ENTRY_TYPE), ...
+                             maneuver_library));
+if isempty(entry_indices)
+    error('No primitive of type "%s" found.', ENTRY_TYPE);
+end
+i_curr = entry_indices(randi(numel(entry_indices)));
+fprintf('Entry primitive: [%d] %s  V=%.1f m/s\n\n', ...
+        i_curr, maneuver_library{i_curr}.maneuver_type, ...
+        norm(maneuver_library{i_curr}.trim_state(1:3)));
+
+%% ── STORAGE ───────────────────────────────────────────────────────────────
+X_full   = [];
+U_full   = [];
+T_full   = [];
+seg_type = [];   % 1=trim, 2=transition
+seg_idx  = [];   % which primitive index each row belongs to
+t_off    = 0;
+pos_off  = zeros(3,1);   % position offset for spatial continuity
+
+prim_sequence = i_curr;  % record which primitives were visited
+
+%% ── GRAPH WALK ────────────────────────────────────────────────────────────
+for seg = 1:N_SEGMENTS
+
+    man = maneuver_library{i_curr};
+
+    %% ---- Trim segment ----
+    u_trim = ctrl_vec(man.trim_controls);
+    x_start = man.trim_state;
+    x_start(11:13) = pos_off;   % spatial continuity: use current position,
+                                % NOT trim_state position (which would add
+                                % the stored altitude on top every segment)
+
+    [Tm, Xm, Um] = simulate_trim(x_start, u_trim, TRIM_DURATION, DT_SIM, aircraft);
+
+    [X_full, U_full, T_full, seg_type, seg_idx] = ...
+        append_seg(X_full, U_full, T_full, seg_type, seg_idx, ...
+                   Xm, Um, Tm, t_off, 1, i_curr);
+    t_off   = T_full(end);
+    pos_off = Xm(end, 11:13)';   % position at END of trim segment
+    x_end   = Xm(end,:)';
+
+    fprintf('[Seg %d]  Trim  [%d] %-28s  V=%6.1f  alt=%6.0f m\n', ...
+            seg, i_curr, man.maneuver_type, ...
+            norm(x_end(1:3)), -x_end(13));
+
+    if seg == N_SEGMENTS, break; end   % no transition after last trim
+
+    %% ---- Pick next primitive ----
+    nbrs  = adj{i_curr};
+    costs = adj_cost{i_curr};
+
+    if isempty(nbrs)
+        fprintf('  Dead end at primitive %d — stopping early.\n', i_curr);
+        break;
+    end
+
+    if WEIGHT_BY_COST && ~all(isinf(costs)) && ~all(isnan(costs))
+        % Weight by 1/cost (lower cost → more probable)
+        c_safe  = costs;
+        c_safe(~isfinite(c_safe)) = max(c_safe(isfinite(c_safe)))*10;
+        weights = 1 ./ max(c_safe, 1e-9);
+        weights = weights / sum(weights);
+        i_next  = nbrs(randsample(numel(nbrs), 1, true, weights));
+    else
+        i_next = nbrs(randi(numel(nbrs)));
+    end
+
+    %% ---- Transition segment ----
+    tr = transition_library(i_curr, i_next);
+
+    % Apply position offset so trajectory is spatially continuous.
+    % The stored transition starts at the original trim_state position,
+    % so we compute offset = (current position) − (stored start position).
+    stored_start_pos = tr.X(1, 11:13)';
+    tr_pos_off       = pos_off - stored_start_pos;
+
+    X_tr = tr.X;
+    X_tr(:, 11:13) = X_tr(:, 11:13) + tr_pos_off';   % shift all positions
+
+    [X_full, U_full, T_full, seg_type, seg_idx] = ...
+        append_seg(X_full, U_full, T_full, seg_type, seg_idx, ...
+                   X_tr, tr.U, tr.T, t_off, 2, i_next);
+    t_off   = T_full(end);
+    pos_off = X_full(end, 11:13)';
+
+    fprintf('         Trans [%d]→[%d] %-28s  Tf=%.1fs  cost=%.4g  status=%s\n', ...
+            i_curr, i_next, maneuver_library{i_next}.maneuver_type, ...
+            tr.Tf, tr.cost, tr.solver_status);
+
+    i_curr = i_next;
+    prim_sequence(end+1) = i_curr; %#ok<AGROW>
+end
+
+fprintf('\nPrimitive sequence: ');
+fprintf('%d → ', prim_sequence(1:end-1));
+fprintf('%d\n\n', prim_sequence(end));
+
+%% ── PLOTS ─────────────────────────────────────────────────────────────────
+plot_trajectory(X_full, U_full, T_full, seg_type, prim_sequence, ...
+                maneuver_library, aircraft);
+
+end % main
+
+
+%% =========================================================================
+%% HELPERS
+%% =========================================================================
+
+%% ---- is_feasible --------------------------------------------------------
+function ok = is_feasible(entry, accept_acceptable)
+    if ~entry.feasible, ok = false; return; end
+    s = entry.solver_status;
+    ok = contains(s, 'Solve_Succeeded');
+    if accept_acceptable
+        ok = ok || contains(s, 'Acceptable') || contains(s, 'acceptable');
+    end
+end
+
+%% ---- ctrl_vec -----------------------------------------------------------
+function u = ctrl_vec(c)
+    u = [c.thrust; c.delta_e; c.delta_a; c.delta_r];
+end
+
+%% ---- append_seg ---------------------------------------------------------
+function [X,U,T,st,si] = append_seg(X,U,T,st,si,Xn,Un,Tn,t_off,type,idx)
+    X  = [X;  Xn];
+    U  = [U;  Un];
+    T  = [T;  Tn + t_off];
+    st = [st; type * ones(size(Xn,1),1)];
+    si = [si; idx  * ones(size(Xn,1),1)];
+end
+
+%% ---- simulate_trim ------------------------------------------------------
+function [T,X,U] = simulate_trim(x0, u_trim, Tf, dt, aircraft)
+    N  = round(Tf/dt) + 1;
+    T  = linspace(0, Tf, N)';
+    X  = zeros(N,13);
+    U  = repmat(u_trim', N, 1);
+    X(1,:) = x0';
+    for k = 1:N-1
+        xk = X(k,:)';
+        f1 = F18_6DOF(xk, u_trim, aircraft);
+        f2 = F18_6DOF(xk+0.5*dt*f1, u_trim, aircraft);
+        f3 = F18_6DOF(xk+0.5*dt*f2, u_trim, aircraft);
+        f4 = F18_6DOF(xk+dt*f3,     u_trim, aircraft);
+        xk1 = xk + dt/6*(f1+2*f2+2*f3+f4);
+        xk1(7:10) = xk1(7:10)/norm(xk1(7:10));
+        X(k+1,:) = xk1';
+    end
+end
+
+%% ---- plot_trajectory ----------------------------------------------------
+function plot_trajectory(X, U, T, seg_type, prim_seq, ml, aircraft)
+    idx_m = seg_type==1;
+    idx_t = seg_type==2;
+
+    % Break line at segment boundaries for clean plotting
+    Xp = X;
+    for k = 2:size(X,1)
+        if seg_type(k) ~= seg_type(k-1)
+            Xp(k,11:13) = NaN;
+        end
+    end
+
+    %% 3-D trajectory
+    figure('Color','w','Name','Random Trajectory — 3D');
+    hold on; grid on; axis equal;
+    h1 = plot3(Xp(idx_m,11), Xp(idx_m,12), -Xp(idx_m,13), ...
+               'b', 'LineWidth', 2.5);
+    h2 = plot3(Xp(idx_t,11), Xp(idx_t,12), -Xp(idx_t,13), ...
+               'r', 'LineWidth', 2.0);
+    % Mark primitive entry points
+    prim_starts = find([1; diff(seg_type)==0 & [diff(seg_type(1:end-1));0]==0] & seg_type==1);
+    plot3(X(1,11), X(1,12), -X(1,13), 'go', 'MarkerSize',10,'MarkerFaceColor','g');
+    plot3(X(end,11), X(end,12), -X(end,13), 'rs','MarkerSize',10,'MarkerFaceColor','r');
+    xlabel('X North [m]'); ylabel('Y East [m]'); zlabel('Alt [m]');
+    title(sprintf('Random Trajectory  (%d primitives)', numel(prim_seq)));
+    legend([h1 h2], 'Trim segment', 'Transition', 'Location','best');
+    view(30,20);
+
+    %% Aero states
+    u_b = X(:,1); v_b = X(:,2); w_b = X(:,3);
+    V   = sqrt(u_b.^2+v_b.^2+w_b.^2);
+    alp = atan2(w_b, u_b)*180/pi;
+    bet = asin(v_b./max(V,1))*180/pi;
+    alt = -X(:,13);
+
+    figure('Color','w','Name','Aero States');
+    subplot(4,1,1); plot(T,V,'k','LineWidth',1.5); grid on;
+    shade_transitions(T, seg_type);
+    ylabel('V [m/s]'); title('Airspeed');
+
+    subplot(4,1,2); plot(T,alp,'b','LineWidth',1.5); grid on;
+    shade_transitions(T, seg_type);
+    yline(28,'r--'); yline(-5,'r--');
+    ylabel('\alpha [deg]');
+
+    subplot(4,1,3); plot(T,bet,'r','LineWidth',1.5); grid on;
+    shade_transitions(T, seg_type);
+    yline(5,'r--'); yline(-5,'r--');
+    ylabel('\beta [deg]');
+
+    subplot(4,1,4); plot(T,alt,'m','LineWidth',1.5); grid on;
+    shade_transitions(T, seg_type);
+    ylabel('Alt [m]'); xlabel('Time [s]');
+
+    %% Load factor
+    qbar = 0.5*1.225*V.^2;
+    Nz   = qbar.*aircraft.aero.S_ref.*aircraft.aero.CL_alpha.*atan2(w_b,u_b) ...
+           / (aircraft.mass*9.81);
+
+    figure('Color','w','Name','Load Factor');
+    hold on; grid on;
+    shade_transitions(T, seg_type);
+    plot(T, Nz, 'b','LineWidth',2);
+    yline( 9,'r--','Label','+9g'); yline(-3,'r--','Label','-3g');
+    yline( 1,'k:');
+    xlabel('Time [s]'); ylabel('Nz [g]');
+    title('Load Factor');
+    fprintf('  Nz: max=%.2fg  min=%.2fg\n', max(Nz), min(Nz));
+
+    %% Primitive label timeline
+    figure('Color','w','Name','Primitive Sequence');
+    hold on; grid on;
+    colors = lines(numel(prim_seq));
+    seg_changes = [1; find(diff(seg_type)==1 & seg_type(2:end)==1)+1];
+    for k = 1:min(numel(seg_changes), numel(prim_seq))
+        t_s = T(seg_changes(k));
+        t_e = T(min(seg_changes(k) + round(5/0.01), end));  % approx duration
+        patch([t_s t_e t_e t_s], [0 0 1 1], colors(k,:), ...
+              'FaceAlpha', 0.5, 'EdgeColor','none');
+        text(t_s+0.2, 0.5, ...
+             strrep(ml{prim_seq(k)}.maneuver_type,'_',' '), ...
+             'FontSize', 7, 'Interpreter','none');
+    end
+    xlim([T(1) T(end)]); ylim([0 1]);
+    xlabel('Time [s]'); yticks([]);
+    title('Primitive Sequence Timeline');
+end
+
+%% ---- shade_transitions --------------------------------------------------
+function shade_transitions(T, seg_type)
+    % Shade transition regions in light orange on current axes
+    in_tr = seg_type==2;
+    if ~any(in_tr), return; end
+    starts = find(diff([0; in_tr])==1);
+    ends   = find(diff([in_tr; 0])==-1);
+    yl = ylim;
+    for k = 1:numel(starts)
+        patch([T(starts(k)) T(ends(k)) T(ends(k)) T(starts(k))], ...
+              [yl(1) yl(1) yl(2) yl(2)], ...
+              [1 0.85 0.6], 'FaceAlpha', 0.3, 'EdgeColor','none');
+    end
+end
+
+
+%% =========================================================================
+%% DYNAMICS  (pure MATLAB — no CasADi needed here)
+%% =========================================================================
+function xdot = F18_6DOF(x, u, a)
+    u_b=x(1); v=x(2);  w=x(3);
+    p=x(4);   q=x(5);  r=x(6);
+    q0=x(7);  q1=x(8); q2=x(9); q3=x(10);
+    T=u(1); de=u(2); da=u(3); dr=u(4);
+
+    rho=1.225; V=max(norm([u_b v w]),1); qbar=0.5*rho*V^2;
+    alp=atan2(w,u_b); bet=asin(v/V);
+
+    CL=a.aero.CL_alpha*alp;
+    CD=a.aero.CD0+a.aero.k*CL^2+a.aero.k_alpha2*alp^2;
+    CY=a.aero.CY_beta*bet+a.aero.CY_dr*dr;
+
+    Cwb=[cos(alp)*cos(bet),  sin(bet), sin(alp)*cos(bet);
+        -cos(alp)*sin(bet),  cos(bet),-sin(alp)*sin(bet);
+        -sin(alp),           0,        cos(alp)];
+    Fb=Cwb'*[T-qbar*a.aero.S_ref*CD; qbar*a.aero.S_ref*CY; -qbar*a.aero.S_ref*CL];
+
+    Rbi=[1-2*(q2^2+q3^2), 2*(q1*q2-q0*q3), 2*(q1*q3+q0*q2);
+          2*(q1*q2+q0*q3),1-2*(q1^2+q3^2), 2*(q2*q3-q0*q1);
+          2*(q1*q3-q0*q2), 2*(q2*q3+q0*q1),1-2*(q1^2+q2^2)];
+    Fg=a.mass*(Rbi'*[0;0;9.81]);
+
+    ud=(Fb(1)+Fg(1))/a.mass+r*v-q*w;
+    vd=(Fb(2)+Fg(2))/a.mass+p*w-r*u_b;
+    wd=(Fb(3)+Fg(3))/a.mass+q*u_b-p*v;
+
+    I=[a.Ixx,0,-a.Ixz;0,a.Iyy,0;-a.Ixz,0,a.Izz]; om=[p;q;r];
+    Cm=a.aero.Cm_alpha*alp+a.aero.Cm_q*(a.aero.c_bar/(2*V))*q+a.aero.Cm_delta_e*de;
+    Cl=a.aero.Cl_beta*bet+a.aero.Cl_p*(a.aero.b/(2*V))*p+a.aero.Cl_r*(a.aero.b/(2*V))*r+a.aero.Cl_delta_a*da+a.aero.Cl_delta_r*dr;
+    Cn=a.aero.Cn_beta*bet+a.aero.Cn_p*(a.aero.b/(2*V))*p+a.aero.Cn_r*(a.aero.b/(2*V))*r+a.aero.Cn_delta_a*da+a.aero.Cn_delta_r*dr;
+
+    Lm=qbar*a.aero.S_ref*a.aero.b*Cl;
+    Mm=qbar*a.aero.S_ref*a.aero.c_bar*Cm;
+    Nm=qbar*a.aero.S_ref*a.aero.b*Cn;
+
+    om_d=I\([Lm;Mm;Nm]-cross(om,I*om));
+    Om=[0,-p,-q,-r;p,0,r,-q;q,-r,0,p;r,q,-p,0];
+    qd=0.5*Om*[q0;q1;q2;q3];
+    vi=Rbi*[u_b;v;w];
+    xdot=[ud;vd;wd;om_d;qd;vi];
+end
+
+
+%% =========================================================================
+%% AIRCRAFT PARAMETERS  (corrected — must match maneuver_library)
+%% =========================================================================
+function a = get_f18_harv_parameters()
+    a.mass=15096.5; a.Ixx=31183.6; a.Iyy=205127.5; a.Izz=230432.1; a.Ixz=4028.0;
+    a.aero.S_ref=37.16; a.aero.c_bar=3.511; a.aero.b=11.404;
+    a.aero.CL_alpha=5.0; a.aero.CD0=0.02; a.aero.k=0.08; a.aero.k_alpha2=0.3;
+    a.aero.Cm_alpha=-0.45; a.aero.Cm_q=-4.5; a.aero.Cm_delta_e=-0.5;
+    a.aero.Cl_beta=-0.08; a.aero.Cl_p=-0.3; a.aero.Cl_r=0.05;
+    a.aero.Cl_delta_a=-0.15; a.aero.Cl_delta_r=0.05;
+    a.aero.Cn_beta=0.08; a.aero.Cn_p=-0.03; a.aero.Cn_r=-0.15;
+    a.aero.Cn_delta_a=-0.01; a.aero.Cn_delta_r=-0.12;
+    a.aero.CY_beta=-0.73; a.aero.CY_dr=0.2;
+end

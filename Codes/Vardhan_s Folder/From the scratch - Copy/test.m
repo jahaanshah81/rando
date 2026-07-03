@@ -1,0 +1,1087 @@
+function Maneuver_Library_Complete()
+%MANEUVER_LIBRARY_COMPLETE  F-18 HARV trim-primitive library.
+%
+%  Manoeuvre segment coverage
+%  ─────────────────────────────────────────────────────────────────────
+%  Split-S      : inverted_level → pull_down_trim → steady_level_heading
+%  Immelmann    : steady_level_heading → pull_up_trim → inverted_level
+%  High-G Turn  : steady_level_heading → high_g_turn_{l|r} → steady_level_heading
+%  Barrel Roll  : climbing_{l|r}_turn → inverted_level → descending_{l|r}_turn
+%  Vertical Jink: steady_level → pull_up_trim  (up)
+%                               → push_over_trim (down)
+%  Slice Turn   : steady_level_heading → high_g_turn_{l|r}(gamma<0)
+%  Break Turn   : high_g_turn Nz 6-9 g  (same segment type, higher Nz)
+%  Chandelle    : climbing_{l|r}_turn (steep gamma, high alpha exit)
+
+clc; close all;
+fprintf('=== F-18 HARV Maneuver Library Generator ===\n\n');
+
+aircraft = get_f18_harv_parameters();
+DT = 0.01;   % integration timestep [s]
+
+maneuver_library = build_comprehensive_maneuver_library(aircraft, DT);
+save('maneuver_library.mat', 'maneuver_library');
+fprintf('\n[DONE] %d segments saved to maneuver_library.mat\n', numel(maneuver_library));
+plot_all_maneuvers(maneuver_library);
+end
+
+
+%% ===================================================================
+%  LIBRARY BUILDER
+% ====================================================================
+function ml = build_comprehensive_maneuver_library(aircraft, dt)
+
+ml = {};
+fprintf('Building maneuver library...\n\n');
+
+% ------------------------------------------------------------------ %
+%  1. STEADY LEVEL  (psi = 0, varies V)                               %
+%     Role: generic cruise, Split-S / Immelmann / High-G entry/exit   %
+% ------------------------------------------------------------------ %
+fprintf('  1. Steady Level (psi=0)...\n'); sc=0;
+for i = 1:15
+    V = 120 + (i-1)*10;           % 120 → 260 m/s
+    d = generate_steady_level(V, 4000, 0, aircraft, dt, 5);
+    if ~isempty(d), ml{end+1}=d; sc=sc+1; end
+end
+fprintf('     [OK] %d segments.\n', sc);
+
+% ------------------------------------------------------------------ %
+%  2. STEADY LEVEL — MULTI-HEADING                                     %
+%     Role: entry/exit at arbitrary compass heading                    %
+%     Segments: 8 headings × 5 speeds = 40                            %
+% ------------------------------------------------------------------ %
+fprintf('  2. Steady Level (multi-heading)...\n'); sc=0;
+for hi = 3                       % 0, 45, 90, …, 315 deg
+    psi_deg = (hi-1)*45;
+    if psi_deg == 0, continue; end % already covered above
+    for si = 1:10
+        V = 120 + (si-1)*15;       % 160, 180, 200, 220, 240 m/s
+        d = generate_steady_level(V, 4000, psi_deg, aircraft, dt, 5);
+        if ~isempty(d), ml{end+1}=d; sc=sc+1; end
+    end
+end
+fprintf('     [OK] %d segments.\n', sc);
+% 
+% % ------------------------------------------------------------------ %
+% %  3. INVERTED LEVEL — MULTI-HEADING                                   %
+% %     Role: Split-S entry, Immelmann apex, Barrel Roll top             %
+% %     psi=0   → Split-S / Barrel Roll apex                            %
+% %     psi=180 → Immelmann apex (heading reversed at top)              %
+% % ------------------------------------------------------------------ %
+% fprintf('  3. Inverted Level (multi-heading)...\n'); sc=0;
+% inv_headings = [0 90 180 270];
+% for hi = 1:length(inv_headings)
+%     for si = 1:5
+%         V = 180 + (si-1)*20;       % 180 → 260 m/s
+%         d = generate_inverted_level(V, 4000, inv_headings(hi), aircraft, dt, 5);
+%         if ~isempty(d), ml{end+1}=d; sc=sc+1; end
+%     end
+% end
+% fprintf('     [OK] %d segments.\n', sc);
+% 
+% ------------------------------------------------------------------ %
+%  4. CLIMB                                                            %
+% ------------------------------------------------------------------ %
+% fprintf('  4. Climb...\n'); sc=0;
+% for i = 1:15
+%     V     = 120 + (i-1)*5;
+%     gamma =   2 + (i-1)*1.0;      % 2 → 16 deg
+%     d = generate_gamma_trim(V, gamma, 4000, aircraft, dt, 5);
+%     if ~isempty(d), ml{end+1}=d; sc=sc+1; end
+% end
+% fprintf('     [OK] %d segments.\n', sc);
+% 
+% % ------------------------------------------------------------------ %
+% %  5. DESCENT                                                          %
+% % ------------------------------------------------------------------ %
+% fprintf('  5. Descent...\n'); sc=0;
+% for i = 1:15
+%     V     = 150 + (i-1)*5;
+%     gamma =  -1 - (i-1)*0.3;      % -1 → -5.2 deg
+%     d = generate_gamma_trim(V, gamma, 4000, aircraft, dt, 5);
+%     if ~isempty(d), ml{end+1}=d; sc=sc+1; end
+% end
+% fprintf('     [OK] %d segments.\n', sc);
+% 
+% % ------------------------------------------------------------------ %
+% %  6. RIGHT TURN (level, low–moderate g)                               %
+% % ------------------------------------------------------------------ %
+% fprintf('  6. Right Turn...\n'); sc=0;
+% for i = 1:15
+%     V  = 150 + (i-1)*3;
+%     tr = -0.9 - (i-1)*0.1;        % psi_dot [deg/s], negative = right
+%     d = generate_level_turn(V, tr, 4000, aircraft, dt, 8);
+%     if ~isempty(d), ml{end+1}=d; sc=sc+1; end
+% end
+% fprintf('     [OK] %d segments.\n', sc);
+% 
+% % ------------------------------------------------------------------ %
+% %  7. LEFT TURN (level, low–moderate g)                                %
+% % ------------------------------------------------------------------ %
+% fprintf('  7. Left Turn...\n'); sc=0;
+% for i = 1:15
+%     V  = 150 + (i-1)*3;
+%     tr =  0.9 + (i-1)*0.1;        % positive = left
+%     d = generate_level_turn(V, tr, 4000, aircraft, dt, 8);
+%     if ~isempty(d), ml{end+1}=d; sc=sc+1; end
+% end
+% fprintf('     [OK] %d segments.\n', sc);
+% 
+% % ------------------------------------------------------------------ %
+% %  8. CLIMBING LEFT TURN                                               %
+% % ------------------------------------------------------------------ %
+% fprintf('  8. Climbing Left Turn...\n'); sc=0;
+% for i = 1:15
+%     gamma =  2 + (i-1)*1.0;
+%     tr    =  2 + (i-1)*0.2;
+%     d = generate_gamma_turn(200, gamma, tr, 3500, aircraft, dt, 8);
+%     if ~isempty(d), ml{end+1}=d; sc=sc+1; end
+% end
+% fprintf('     [OK] %d segments.\n', sc);
+% 
+% % ------------------------------------------------------------------ %
+% %  9. CLIMBING RIGHT TURN                                              %
+% % ------------------------------------------------------------------ %
+% fprintf('  9. Climbing Right Turn...\n'); sc=0;
+% for i = 1:15
+%     gamma =  2 + (i-1)*1.0;
+%     tr    = -2 - (i-1)*0.2;
+%     d = generate_gamma_turn(200, gamma, tr, 3500, aircraft, dt, 8);
+%     if ~isempty(d), ml{end+1}=d; sc=sc+1; end
+% end
+% fprintf('     [OK] %d segments.\n', sc);
+% 
+% % ------------------------------------------------------------------ %
+% %  10. DESCENDING RIGHT TURN                                           %
+% % ------------------------------------------------------------------ %
+% fprintf(' 10. Descending Right Turn...\n'); sc=0;
+% for i = 1:15
+%     gamma = -1 - (i-1)*0.2;
+%     tr    = -1.7 - (i-1)*0.35;
+%     d = generate_gamma_turn(165, gamma, tr, 5000, aircraft, dt, 8);
+%     if ~isempty(d), ml{end+1}=d; sc=sc+1; end
+% end
+% fprintf('     [OK] %d segments.\n', sc);
+% 
+% % ------------------------------------------------------------------ %
+% %  11. DESCENDING LEFT TURN                                            %
+% % ------------------------------------------------------------------ %
+% fprintf(' 11. Descending Left Turn...\n'); sc=0;
+% for i = 1:15
+%     gamma = -1 - (i-1)*0.2;
+%     tr    =  1.7 + (i-1)*0.35;
+%     d = generate_gamma_turn(165, gamma, tr, 5000, aircraft, dt, 8);
+%     if ~isempty(d), ml{end+1}=d; sc=sc+1; end
+% end
+% fprintf('     [OK] %d segments.\n', sc);
+% 
+% % ------------------------------------------------------------------ %
+% %  12. PULL-UP TRIM  (Immelmann entry, Vertical Jink up)              %
+% %      phi=0 (upright), constant positive pitch rate                   %
+% % ------------------------------------------------------------------ %
+% fprintf(' 12. Pull-Up Trim...\n'); sc=0;
+% for i = 1:15
+%     V  = 200 + (i-1)*10;          % 200 → 340 m/s
+%     Nz =   4 + (i-1)*(3/14);      % 3g → 6g
+%     d = generate_pull_up_trim(V, 4000, Nz, aircraft, dt, 20);
+%     if ~isempty(d), ml{end+1}=d; sc=sc+1; end
+% end
+% fprintf('     [OK] %d segments.\n', sc);
+% 
+% % ------------------------------------------------------------------ %
+% %  13. PULL-DOWN TRIM  (Split-S nose-down arc)                        %
+% %      phi=pi (inverted), constant positive pitch rate (nose to earth) %
+% % ------------------------------------------------------------------ %
+% fprintf(' 13. Pull-Down Trim...\n'); sc=0;
+% for i = 1:15
+%     V  = 200 + (i-1)*10;
+%     Nz =   2.5 + (i-1)*(3/14);      % 2g → 5g
+%     d = generate_pull_down_trim(V, 4000, Nz, aircraft, dt, 16);
+%     if ~isempty(d), ml{end+1}=d; sc=sc+1; end
+% end
+% fprintf('     [OK] %d segments.\n', sc);
+% 
+% % ------------------------------------------------------------------ %
+% %  14. PUSH-OVER TRIM  (Vertical Jink down, unloaded flight)          %
+% %      phi=0 (upright), negative pitch rate, Nz 0 → -1 g             %
+% % ------------------------------------------------------------------ %
+% fprintf(' 14. Push-Over Trim...\n'); sc=0;
+% for i = 1:15
+%     V  = 200 + (i-1)*10;
+%     Nz = -(i-1)*(1/14);           % 0g → -1g
+%     d = generate_push_over_trim(V, 4000, Nz, aircraft, dt, 15);
+%     if ~isempty(d), ml{end+1}=d; sc=sc+1; end
+% end
+% fprintf('     [OK] %d segments.\n', sc);
+% 
+% % ------------------------------------------------------------------ %
+% %  15. HIGH-G TURN — RIGHT  (level, 3 g → 6 g)                       %
+% %      Core segment for High-G Turn and Break Turn manoeuvres         %
+% % ------------------------------------------------------------------ %
+% fprintf(' 15. High-G Turn Right...\n'); sc=0;
+% for i = 1:15
+%     V  = 200 + (i-1)*10;
+%     Nz =   3 + (i-1)*(3/14);
+%     d = generate_high_g_turn(V, Nz, -1, 4000, 0, aircraft, dt, 15);
+%     if ~isempty(d), ml{end+1}=d; sc=sc+1; end
+% end
+% fprintf('     [OK] %d segments.\n', sc);
+% 
+% % ------------------------------------------------------------------ %
+% %  16. HIGH-G TURN — LEFT                                              %
+% % ------------------------------------------------------------------ %
+% fprintf(' 16. High-G Turn Left...\n'); sc=0;
+% for i = 1:15
+%     V  = 200 + (i-1)*10;
+%     Nz =   3 + (i-1)*(3/14);
+%     d = generate_high_g_turn(V, Nz, +1, 4000, 0, aircraft, dt, 15);
+%     if ~isempty(d), ml{end+1}=d; sc=sc+1; end
+% end
+% fprintf('     [OK] %d segments.\n', sc);
+% 
+% % ------------------------------------------------------------------ %
+% %  17. SLICE TURN — RIGHT  (descending High-G, gamma = -5 deg)        %
+% %      High-G turn combined with descent — typical threat-evasion tactic
+% % ------------------------------------------------------------------ %
+% fprintf(' 17. Slice Turn Right...\n'); sc=0;
+% for i = 1:15
+%     V  = 200 + (i-1)*10;
+%     Nz =   3 + (i-1)*(2/14);      % 3g → 5g
+%     d = generate_high_g_turn(V, Nz, -1, 5000, -5, aircraft, dt, 12);
+%     if ~isempty(d), ml{end+1}=d; sc=sc+1; end
+% end
+% fprintf('     [OK] %d segments.\n', sc);
+% 
+% % ------------------------------------------------------------------ %
+% %  18. SLICE TURN — LEFT                                               %
+% % ------------------------------------------------------------------ %
+% fprintf(' 18. Slice Turn Left...\n'); sc=0;
+% for i = 1:15
+%     V  = 200 + (i-1)*10;
+%     Nz =   3 + (i-1)*(2/14);
+%     d = generate_high_g_turn(V, Nz, +1, 5000, -5, aircraft, dt, 12);
+%     if ~isempty(d), ml{end+1}=d; sc=sc+1; end
+% end
+% fprintf('     [OK] %d segments.\n', sc);
+
+fprintf('\nTotal segments generated: %d\n', numel(ml));
+end
+
+
+%% ===================================================================
+%  SEGMENT GENERATORS
+%  Naming convention for shared helpers:
+%    generate_steady_level     – upright level (any heading)
+%    generate_inverted_level   – inverted level (any heading)
+%    generate_gamma_trim       – climb or descent (gamma +/-)
+%    generate_level_turn       – coordinated level turn (tr +/-)
+%    generate_gamma_turn       – climbing/descending coordinated turn
+%    generate_pull_up_trim     – upright constant-q pull-up (Nz > 1)
+%    generate_pull_down_trim   – inverted constant-q pull-down (Nz > 1)
+%    generate_push_over_trim   – upright constant-q push-over (Nz ≤ 0)
+%    generate_high_g_turn      – high-g banked turn, optional gamma
+% ====================================================================
+
+%% ----- 1 / 2.  STEADY LEVEL (any heading psi_deg) -----------------
+function md = generate_steady_level(V, altitude, psi_deg, aircraft, dt, duration)
+md = [];
+psi_rad = deg2rad(psi_deg);
+
+% Smart initial guess based on required CL
+qbar_0 = 0.5*1.225*V^2;
+CL_req  = aircraft.mass*9.81 / (qbar_0*aircraft.aero.S_ref);
+alpha_g = CL_req / aircraft.aero.CL_alpha;
+T_g     = qbar_0*aircraft.aero.S_ref*(aircraft.aero.CD0 + aircraft.aero.k*CL_req^2);
+x0  = [alpha_g; -deg2rad(1); alpha_g; T_g];
+lb  = [deg2rad(-5);  deg2rad(-24);   deg2rad(-30); 500   ];
+ub  = [deg2rad(20);  deg2rad(10.5);  deg2rad(45);  143200];
+opts = make_opts('off');
+
+[tv, ~, ef] = fmincon(@cost4, x0, [],[],[],[], lb,ub, @con4, opts);
+if ef <= 0
+    fprintf('    [FAIL] SteadyLevel V=%.0f psi=%.0f\n', V, psi_deg); return;
+end
+alpha=tv(1); de=tv(2); theta=tv(3); T=tv(4);
+[q0c,q1c,q2c,q3c] = euler_to_quaternion(0, theta, psi_rad);
+trim_s = [V*cos(alpha);0;V*sin(alpha); 0;0;0; q0c;q1c;q2c;q3c; 0;0;-altitude];
+trim_c = struct('thrust',T,'delta_e',de,'delta_a',0,'delta_r',0);
+if psi_deg == 0
+    type_str = 'steady_level';
+else
+    type_str = 'steady_level_heading';
+end
+md = simulate_trim(trim_s, trim_c, type_str, duration, dt, aircraft);
+md.heading_deg = psi_deg;
+
+    function [c,ceq] = con4(v)
+        ac=v(1); dc=v(2); tc=v(3); Tc=v(4);
+        [q0x,q1x,q2x,q3x] = euler_to_quaternion(0,tc,0);
+        ctrl = struct('thrust',Tc,'delta_e',dc,'delta_a',0,'delta_r',0);
+        sv   = [V*cos(ac);0;V*sin(ac);0;0;0;q0x;q1x;q2x;q3x;0;0;-altitude];
+        sd   = F18_HARV_dynamics(0,sv,ctrl,aircraft);
+        ceq  = [sd(1); sd(3); sd(5); sd(13)];
+        c    = [];
+    end
+    function val = cost4(v)
+        val = 1e-8*v(4)^2 + v(2)^2;
+    end
+end
+
+
+%% ----- 3.  INVERTED LEVEL (any heading psi_deg) -------------------
+function md = generate_inverted_level(V, altitude, psi_deg, aircraft, dt, duration)
+md = [];
+psi_rad = deg2rad(psi_deg);
+
+% For inverted level, CL must be negative (lift points inertially upward
+% from an inverted aircraft, i.e. downward in body frame)
+qbar_0 = 0.5*1.225*V^2;
+CL_req  = -aircraft.mass*9.81 / (qbar_0*aircraft.aero.S_ref);  % negative
+alpha_g =  CL_req / aircraft.aero.CL_alpha;                     % negative
+T_g     =  qbar_0*aircraft.aero.S_ref*(aircraft.aero.CD0 + aircraft.aero.k*CL_req^2);
+x0  = [alpha_g; deg2rad(2); alpha_g; T_g];   % de>0 (fwd stick, inverted nose-up)
+lb  = [deg2rad(-20); deg2rad(-24);  deg2rad(-30); 500   ];
+ub  = [deg2rad(10);  deg2rad(10.5); deg2rad(30);  143200];
+opts = make_opts('off');
+
+[tv, ~, ef] = fmincon(@cost4, x0, [],[],[],[], lb,ub, @con4, opts);
+if ef <= 0
+    fprintf('    [FAIL] InvertedLevel V=%.0f psi=%.0f\n', V, psi_deg); return;
+end
+alpha=tv(1); de=tv(2); theta=tv(3); T=tv(4);
+[q0c,q1c,q2c,q3c] = euler_to_quaternion(pi, theta, psi_rad);
+trim_s = [V*cos(alpha);0;V*sin(alpha); 0;0;0; q0c;q1c;q2c;q3c; 0;0;-altitude];
+trim_c = struct('thrust',T,'delta_e',de,'delta_a',0,'delta_r',0);
+if psi_deg == 0
+    type_str = 'inverted_level';
+else
+    type_str = 'inverted_level_heading';
+end
+md = simulate_trim(trim_s, trim_c, type_str, duration, dt, aircraft);
+md.heading_deg = psi_deg;
+
+    function [c,ceq] = con4(v)
+        ac=v(1); dc=v(2); tc=v(3); Tc=v(4);
+        [q0x,q1x,q2x,q3x] = euler_to_quaternion(pi,tc,0);  % phi=pi enforced
+        ctrl = struct('thrust',Tc,'delta_e',dc,'delta_a',0,'delta_r',0);
+        sv   = [V*cos(ac);0;V*sin(ac);0;0;0;q0x;q1x;q2x;q3x;0;0;-altitude];
+        sd   = F18_HARV_dynamics(0,sv,ctrl,aircraft);
+        ceq  = [sd(1); sd(3); sd(5); sd(13)];
+        c    = [];
+    end
+    function val = cost4(v)
+        val = 1e-8*v(4)^2 + v(2)^2;
+    end
+end
+
+
+%% ----- 4 / 5.  CLIMB or DESCENT (sign of gamma_deg) --------------
+function md = generate_gamma_trim(V, gamma_deg, altitude, aircraft, dt, duration)
+md = [];
+g_rad = deg2rad(gamma_deg);
+
+qbar_0  = 0.5*1.225*V^2;
+CL_0    = aircraft.mass*9.81*cos(g_rad) / (qbar_0*aircraft.aero.S_ref);
+alpha_g = CL_0 / aircraft.aero.CL_alpha;
+T_g     = qbar_0*aircraft.aero.S_ref*(aircraft.aero.CD0+aircraft.aero.k*CL_0^2) ...
+          + aircraft.mass*9.81*sin(g_rad);
+T_g     = max(500, T_g);
+x0  = [alpha_g; -deg2rad(1); alpha_g+g_rad; T_g];
+lb  = [deg2rad(-8);  deg2rad(-24);  deg2rad(-30); 500   ];
+ub  = [deg2rad(25);  deg2rad(10.5); deg2rad(45);  143200];
+opts = make_opts('off');
+
+[tv, ~, ef] = fmincon(@cost4, x0, [],[],[],[], lb,ub, @con4, opts);
+if ef <= 0
+    fprintf('    [FAIL] Gamma trim V=%.0f gamma=%.1f\n',V,gamma_deg); return;
+end
+alpha=tv(1); de=tv(2); theta=tv(3); T=tv(4);
+[q0c,q1c,q2c,q3c] = euler_to_quaternion(0,theta,0);
+trim_s = [V*cos(alpha);0;V*sin(alpha);0;0;0;q0c;q1c;q2c;q3c;0;0;-altitude];
+trim_c = struct('thrust',T,'delta_e',de,'delta_a',0,'delta_r',0);
+type_str = 'descent'; if gamma_deg >= 0, type_str = 'climb'; end
+md = simulate_trim(trim_s, trim_c, type_str, duration, dt, aircraft);
+md.gamma_deg = gamma_deg;
+
+    function [c,ceq] = con4(v)
+        ac=v(1); dc=v(2); tc=v(3); Tc=v(4);
+        [q0x,q1x,q2x,q3x] = euler_to_quaternion(0,tc,0);
+        ctrl = struct('thrust',Tc,'delta_e',dc,'delta_a',0,'delta_r',0);
+        sv   = [V*cos(ac);0;V*sin(ac);0;0;0;q0x;q1x;q2x;q3x;0;0;-altitude];
+        sd   = F18_HARV_dynamics(0,sv,ctrl,aircraft);
+        ceq  = [sd(1); sd(3); sd(5); sd(13)+V*sin(g_rad)];  % climb rate
+        c    = [];
+    end
+    function val = cost4(v)
+        val = 1e-8*v(4)^2 + v(2)^2;
+    end
+end
+
+
+%% ----- 6 / 7.  LEVEL TURN  (sign of tr_dps determines direction) --
+function md = generate_level_turn(V, tr_dps, altitude, aircraft, dt, duration)
+md = [];
+g         = 9.81;
+tr_rad    = deg2rad(tr_dps);       % signed psi_dot [rad/s]
+phi_guess = atan(V*tr_rad/g);      % nominal bank angle
+
+qbar_0    = 0.5*1.225*V^2;
+CL_0      = aircraft.mass*g / (qbar_0*aircraft.aero.S_ref*max(cos(phi_guess),0.1));
+T_g       = 1.3*qbar_0*aircraft.aero.S_ref*(aircraft.aero.CD0+aircraft.aero.k*CL_0^2);
+alpha_g   = deg2rad(6);
+% vars: [alpha, beta, de, da, dr, phi, theta, T]
+x0  = [alpha_g; 0; -deg2rad(1); 0; 0; phi_guess; alpha_g; T_g];
+lb  = [deg2rad(-10); deg2rad(-15); deg2rad(-24); deg2rad(-25); deg2rad(-30); deg2rad(-85); deg2rad(-30); 500   ];
+ub  = [deg2rad(25);  deg2rad(15);  deg2rad(10.5); deg2rad(25);  deg2rad(30);  deg2rad(85);  deg2rad(45);  143200];
+opts = make_opts('off');
+
+[tv, ~, ef] = fmincon(@cost8, x0, [],[],[],[], lb,ub, @con8, opts);
+if ef <= 0
+    fprintf('    [FAIL] LevelTurn V=%.0f tr=%.2f\n',V,tr_dps); return;
+end
+[alpha,beta,de,da,dr,phi,theta,T] = unpack8(tv);
+[p,q,r] = body_rates(phi, theta, tr_rad);
+[q0c,q1c,q2c,q3c] = euler_to_quaternion(phi,theta,0);
+u=V*cos(alpha)*cos(beta); v=V*sin(beta); w=V*sin(alpha)*cos(beta);
+trim_s = [u;v;w;p;q;r;q0c;q1c;q2c;q3c;0;0;-altitude];
+trim_c = struct('thrust',T,'delta_e',de,'delta_a',da,'delta_r',dr);
+type_str = 'right_turn'; if tr_dps > 0, type_str = 'left_turn'; end
+md = simulate_trim(trim_s, trim_c, type_str, duration, dt, aircraft);
+md.turn_rate_dps = tr_dps;
+
+    function [c,ceq] = con8(v)
+        [ac,bc,dc,dac,drc,phc,thc,Tc] = unpack8(v);
+        uc=V*cos(ac)*cos(bc); vc=V*sin(bc); wc=V*sin(ac)*cos(bc);
+        [pc,qc,rc] = body_rates(phc, thc, tr_rad);
+        [q0x,q1x,q2x,q3x] = euler_to_quaternion(phc,thc,0);
+        ctrl = struct('thrust',Tc,'delta_e',dc,'delta_a',dac,'delta_r',drc);
+        sv   = [uc;vc;wc;pc;qc;rc;q0x;q1x;q2x;q3x;0;0;-altitude];
+        sd   = F18_HARV_dynamics(0,sv,ctrl,aircraft);
+        phi_bal = tan(phc) - V*tr_rad/g;
+        ceq = [sd(1); sd(3); sd(4); sd(5); sd(6); sd(13); bc; phi_bal];
+        c   = [];
+    end
+    function val = cost8(v)
+        val = 1e-8*v(8)^2 + v(3)^2 + 5*v(4)^2 + 5*v(5)^2 + 50*v(2)^2;
+    end
+end
+
+
+%% ----- 8-11.  CLIMBING/DESCENDING TURN  (sign of gamma & tr_dps) --
+function md = generate_gamma_turn(V, gamma_deg, tr_dps, altitude, aircraft, dt, duration)
+md = [];
+g       = 9.81;
+g_rad   = deg2rad(gamma_deg);
+tr_rad  = deg2rad(tr_dps);
+phi_guess = atan(V*tr_rad/(g*max(cos(g_rad),0.1)));
+
+qbar_0  = 0.5*1.225*V^2;
+CL_0    = aircraft.mass*g*cos(g_rad) / (qbar_0*aircraft.aero.S_ref*max(cos(phi_guess),0.1));
+T_g     = qbar_0*aircraft.aero.S_ref*(aircraft.aero.CD0+aircraft.aero.k*CL_0^2) ...
+          + aircraft.mass*g*sin(g_rad);
+alpha_g = CL_0 / aircraft.aero.CL_alpha;
+
+x0  = [alpha_g; 0; -deg2rad(1.5); 0; 0; phi_guess; alpha_g+g_rad; max(500,T_g)];
+lb  = [deg2rad(-5);  deg2rad(-10); deg2rad(-24);  deg2rad(-21.5); deg2rad(-30); deg2rad(-80); deg2rad(-30); 500   ];
+ub  = [deg2rad(20);  deg2rad(10);  deg2rad(10.5); deg2rad(21.5);  deg2rad(30);  deg2rad(80);  deg2rad(45);  143200];
+opts = make_opts('off');
+
+[tv, ~, ef] = fmincon(@cost8, x0, [],[],[],[], lb,ub, @con8, opts);
+if ef <= 0
+    fprintf('    [FAIL] GammaTurn V=%.0f g=%.1f tr=%.1f\n',V,gamma_deg,tr_dps); return;
+end
+[alpha,beta,de,da,dr,phi,theta,T] = unpack8(tv);
+[p,q,r] = body_rates(phi, theta, tr_rad);
+[q0c,q1c,q2c,q3c] = euler_to_quaternion(phi,theta,0);
+u=V*cos(alpha)*cos(beta); v=V*sin(beta); w=V*sin(alpha)*cos(beta);
+trim_s = [u;v;w;p;q;r;q0c;q1c;q2c;q3c;0;0;-altitude];
+trim_c = struct('thrust',T,'delta_e',de,'delta_a',da,'delta_r',dr);
+
+if gamma_deg >= 0
+    type_str = 'climbing_right_turn'; if tr_dps > 0, type_str='climbing_left_turn'; end
+else
+    type_str = 'descending_right_turn'; if tr_dps > 0, type_str='descending_left_turn'; end
+end
+md = simulate_trim(trim_s, trim_c, type_str, duration, dt, aircraft);
+md.gamma_deg = gamma_deg;  md.turn_rate_dps = tr_dps;
+
+    function [c,ceq] = con8(v)
+        [ac,bc,dc,dac,drc,phc,thc,Tc] = unpack8(v);
+        uc=V*cos(ac)*cos(bc); vc=V*sin(bc); wc=V*sin(ac)*cos(bc);
+        [pc,qc,rc] = body_rates(phc, thc, tr_rad);
+        [q0x,q1x,q2x,q3x] = euler_to_quaternion(phc,thc,0);
+        ctrl = struct('thrust',Tc,'delta_e',dc,'delta_a',dac,'delta_r',drc);
+        sv   = [uc;vc;wc;pc;qc;rc;q0x;q1x;q2x;q3x;0;0;-altitude];
+        sd   = F18_HARV_dynamics(0,sv,ctrl,aircraft);
+        % climb rate: -z_dot = V*sin(gamma)  (NED: z positive down)
+        phi_bal = tan(phc) - V*tr_rad/(g*max(cos(g_rad),0.1));
+        ceq = [sd(1); sd(3); sd(4); sd(5); sd(6); sd(13)+V*sin(g_rad); bc; phi_bal];
+        c   = [];
+    end
+    function val = cost8(v)
+        val = 1e-8*v(8)^2 + v(3)^2 + 5*v(4)^2 + 5*v(5)^2 + 50*v(2)^2;
+    end
+end
+
+
+%% ----- 12.  PULL-UP TRIM  ----------------------------------------
+%  Upright (phi=0), constant positive pitch rate q_req > 0.
+%  Nz_target > 1 (typically 3–6 g).
+%  Trim vars: [alpha, de, theta, T]
+function md = generate_pull_up_trim(V, altitude, n_target, aircraft, dt, duration)
+md = [];
+g       = 9.81;
+R       = V^2 / (g*(n_target-1));
+q_req   = V / R;   % positive: nose pitches toward sky
+
+qbar_0  = 0.5*1.225*V^2;
+CL_req  = n_target*aircraft.mass*g / (qbar_0*aircraft.aero.S_ref);
+alpha_g = CL_req / aircraft.aero.CL_alpha;
+T_g     = qbar_0*aircraft.aero.S_ref*(aircraft.aero.CD0+aircraft.aero.k*CL_req^2);
+x0  = [alpha_g; -deg2rad(5); deg2rad(15); T_g];
+lb  = [deg2rad(-5);  deg2rad(-24);  deg2rad(-10); 500   ];
+ub  = [deg2rad(30);  deg2rad(10.5); deg2rad(80);  143200];
+opts = make_opts('off');
+
+[tv, ~, ef] = fmincon(@cost4, x0, [],[],[],[], lb,ub, @con4, opts);
+if ef <= 0
+    fprintf('    [FAIL] PullUp V=%.0f Nz=%.2f\n',V,n_target); return;
+end
+alpha=tv(1); de=tv(2); theta=tv(3); T=tv(4);
+[q0c,q1c,q2c,q3c] = euler_to_quaternion(0,theta,0);
+u=V*cos(alpha); w=V*sin(alpha);
+trim_s = [u;0;w; 0;q_req;0; q0c;q1c;q2c;q3c; 0;0;-altitude];
+trim_c = struct('thrust',T,'delta_e',de,'delta_a',0,'delta_r',0);
+md = simulate_trim(trim_s, trim_c, 'pull_up_trim', duration, dt, aircraft);
+md.Nz = n_target;
+fprintf('    [OK] PullUp  V=%.0f  Nz=%.2fg  q=%.3f rad/s\n', V, n_target, q_req);
+
+    function [c,ceq] = con4(v)
+        ac=v(1); dc=v(2); tc=v(3); Tc=v(4);
+        uc=V*cos(ac); wc=V*sin(ac);
+        [q0x,q1x,q2x,q3x] = euler_to_quaternion(0,tc,0);
+        ctrl = struct('thrust',Tc,'delta_e',dc,'delta_a',0,'delta_r',0);
+        sv   = [uc;0;wc;0;q_req;0;q0x;q1x;q2x;q3x;0;0;-altitude];
+        sd   = F18_HARV_dynamics(0,sv,ctrl,aircraft);
+        % Nz via direct CL (robust, sign-correct for all alpha)
+        qb = 0.5*1.225*V^2;
+        Nz_c = qb*aircraft.aero.S_ref*aircraft.aero.CL_alpha*ac / (aircraft.mass*g);
+        ceq = [uc*sd(1)+wc*sd(3);   % constant speed
+               sd(5);               % q_dot = 0
+               Nz_c - n_target];    % load factor target
+        c = [];
+    end
+    function val = cost4(v)
+        val = 1e-8*v(4)^2 + v(2)^2;
+    end
+end
+
+
+%% ----- 13.  PULL-DOWN TRIM  --------------------------------------
+%  Inverted (phi=pi), constant positive pitch rate (nose pitches toward earth).
+%  Nz_target > 1 (typically 2–5 g).
+%  Trim vars: [alpha, de, theta, T]
+
+function maneuver_data = generate_pull_down_trim(V, altitude, n_target, aircraft, dt, duration)
+
+maneuver_data = [];
+g = 9.81;
+
+% ------------------------------------------------------------------
+% BUG FIX 1 — correct centripetal formula for inverted pull-down
+%   OLD : R = V^2 / (g*(n_target - 1))   ← pull-UP formula
+%   NEW : R = V^2 / (g*(n_target + 1))   ← pull-DOWN formula
+% ------------------------------------------------------------------
+R     = V^2 / (g * (n_target + 1));
+q_req = V / R;           % positive body-frame pitch rate → nose toward earth
+
+% ------------------------------------------------------------------
+% Smart initial guess for alpha
+%   For inverted pull-down, CL must balance centripetal + weight.
+%   CL_req ≈ Nz * mg / (qbar * S)  (positive → lift points down for phi=pi)
+% ------------------------------------------------------------------
+qbar_0  = 0.5 * 1.225 * V^2;
+CL_req  = n_target * aircraft.mass * g / (qbar_0 * aircraft.aero.S_ref);
+alpha_g = CL_req / aircraft.aero.CL_alpha;           % positive alpha
+T_g     = qbar_0 * aircraft.aero.S_ref * ...
+          (aircraft.aero.CD0 + aircraft.aero.k * CL_req^2);
+
+% Initial guess — theta well below horizon
+x0 = [alpha_g; deg2rad(3); -deg2rad(45); T_g];
+%     alpha     delta_e      theta          thrust
+
+% ------------------------------------------------------------------
+% BUG FIX 2 — theta upper bound must be NEGATIVE
+%   OLD : ub_theta = +deg2rad(10)  → allows nose-up while inverted
+%                                    → aircraft CLIMBS (wrong!)
+%   NEW : ub_theta = -deg2rad(5)   → nose always below horizon
+%                                    → aircraft DESCENDS (correct)
+% ------------------------------------------------------------------
+lb = [deg2rad(-5);   deg2rad(-24);   deg2rad(-80);  500   ];
+ub = [deg2rad(25);   deg2rad(10.5);  -deg2rad(5);   143200];
+%                                    ↑ was +deg2rad(10): the root cause
+
+opts = optimoptions('fmincon', 'Display', 'off', 'Algorithm', 'sqp', ...
+    'MaxIterations', 1000, 'ConstraintTolerance', 1e-7);
+
+[tv, ~, ef] = fmincon(@cost, x0, [], [], [], [], lb, ub, @constraints, opts);
+
+if ef <= 0
+    fprintf('  [FAIL] PullDown V=%.0f  Nz=%.2f\n', V, n_target);
+    return;
+end
+
+alpha   = tv(1);
+delta_e = tv(2);
+theta   = tv(3);
+thrust  = tv(4);
+
+% Build trim state — phi = pi (inverted)
+u = V * cos(alpha);  v = 0;  w = V * sin(alpha);
+p = 0;  q = q_req;  r = 0;
+[q0c,q1c,q2c,q3c] = euler_to_quaternion(pi, theta, 0);
+
+trim_state    = [u;v;w; p;q;r; q0c;q1c;q2c;q3c; 0;0;-altitude];
+trim_controls = struct('thrust',thrust,'delta_e',delta_e,'delta_a',0,'delta_r',0);
+
+% Verify altitude is actually decreasing (z_dot_NED > 0 → descending)
+sd_check = F18_HARV_dynamics(0, trim_state, trim_controls, aircraft);
+if sd_check(13) <= 0
+    fprintf('  [WARN] PullDown trim found ascending solution — skipping (V=%.0f Nz=%.2f)\n', V, n_target);
+    return;
+end
+
+% Simulate
+num_steps           = ceil(duration / dt);
+trajectory_time     = (0:num_steps-1) * dt;
+trajectory_states   = zeros(13, num_steps);
+trajectory_controls = repmat([thrust; delta_e; 0; 0], 1, num_steps);
+current_state       = trim_state;
+
+for i = 1:num_steps
+    trajectory_states(:, i) = current_state;
+    current_state = rk4_integrator(@F18_HARV_dynamics, 0, current_state, dt, trim_controls, aircraft);
+end
+
+maneuver_data = struct( ...
+    'maneuver_type',       'pull_down_trim', ...
+    'trajectory_time',     trajectory_time, ...
+    'trajectory_states',   trajectory_states, ...
+    'trajectory_controls', trajectory_controls, ...
+    'duration',            duration, ...
+    'trim_state',          trim_state, ...
+    'trim_controls',       trim_controls, ...
+    'Nz',                  n_target);
+
+fprintf('  [OK] PullDown  V=%.0f  Nz=%.2fg  theta=%.1f deg  q=%.3f rad/s  z_dot=+%.1f m/s (descending)\n', ...
+    V, n_target, rad2deg(theta), q_req, sd_check(13));
+
+
+% ---- Nested constraints ----
+function [c, ceq] = constraints(vars)
+    ac  = vars(1);
+    dc  = vars(2);
+    tc  = vars(3);
+    Tc  = vars(4);
+
+    uc = V * cos(ac);
+    wc = V * sin(ac);
+
+    % phi = pi enforced (inverted); q = q_req enforced (not a free variable)
+    [q0x,q1x,q2x,q3x] = euler_to_quaternion(pi, tc, 0);
+    ctrl = struct('thrust',Tc,'delta_e',dc,'delta_a',0,'delta_r',0);
+    sv   = [uc; 0; wc; 0; q_req; 0; q0x;q1x;q2x;q3x; 0;0;-altitude];
+    sd   = F18_HARV_dynamics(0, sv, ctrl, aircraft);
+
+    % --- Constraint 1: constant speed  (V·dV/dt = 0) ---
+    speed_eq = uc * sd(1) + wc * sd(3);
+
+    % --- Constraint 2: steady pitch rate  (q_dot = 0) ---
+    q_dot_eq = sd(5);
+
+    % ------------------------------------------------------------------
+    % BUG FIX 3 — Nz constraint for inverted pull-down
+    %   For phi=pi, positive CL generates lift pointing DOWNWARD (inertially)
+    %   Structural load factor = L / (mg)  where L = qbar·S·CL (positive)
+    %   OLD code used a sign-mixed formula that could be satisfied by
+    %   ascending solutions.
+    % ------------------------------------------------------------------
+    qb   = 0.5 * 1.225 * V^2;
+    Nz_c = qb * aircraft.aero.S_ref * aircraft.aero.CL_alpha * ac ...
+           / (aircraft.mass * g);   % positive when alpha > 0  ✓
+
+    ceq = [speed_eq; q_dot_eq; Nz_c - n_target];
+    c   = [];
+end
+
+function val = cost(vars)
+    val = 1e-8 * vars(4)^2 + vars(2)^2;
+end
+
+end
+
+
+%% ----- 14.  PUSH-OVER TRIM  --------------------------------------
+%  Upright (phi=0), constant NEGATIVE pitch rate (nose pushes down).
+%  n_target in [0, -1]: 0g (unloaded) to -1g (light negative g).
+%  Trim vars: [alpha, de, theta, T]
+function md = generate_push_over_trim(V, altitude, n_target, aircraft, dt, duration)
+md = [];
+g       = 9.81;
+% Radius and pitch rate for push-over
+R       = V^2 / (g*(1 - n_target));   % always positive since n_target <= 0
+q_req   = -V / R;                      % negative: nose pitches toward earth
+
+qbar_0  = 0.5*1.225*V^2;
+CL_req  = n_target*aircraft.mass*g / (qbar_0*aircraft.aero.S_ref); % ≤ 0
+alpha_g = CL_req / aircraft.aero.CL_alpha;   % ≤ 0
+T_g     = qbar_0*aircraft.aero.S_ref*(aircraft.aero.CD0+aircraft.aero.k*CL_req^2);
+x0  = [alpha_g; deg2rad(3); -deg2rad(5); T_g];  % de>0 (fwd stick), theta slightly negative
+lb  = [deg2rad(-15); deg2rad(-24);  deg2rad(-60); 500   ];
+ub  = [deg2rad(10);  deg2rad(10.5); deg2rad(20);  143200];
+opts = make_opts('off');
+
+[tv, ~, ef] = fmincon(@cost4, x0, [],[],[],[], lb,ub, @con4, opts);
+if ef <= 0
+    fprintf('    [FAIL] PushOver V=%.0f Nz=%.2f\n',V,n_target); return;
+end
+alpha=tv(1); de=tv(2); theta=tv(3); T=tv(4);
+[q0c,q1c,q2c,q3c] = euler_to_quaternion(0,theta,0);
+u=V*cos(alpha); w=V*sin(alpha);
+trim_s = [u;0;w; 0;q_req;0; q0c;q1c;q2c;q3c; 0;0;-altitude];
+trim_c = struct('thrust',T,'delta_e',de,'delta_a',0,'delta_r',0);
+md = simulate_trim(trim_s, trim_c, 'push_over_trim', duration, dt, aircraft);
+md.Nz = n_target;
+
+    function [c,ceq] = con4(v)
+        ac=v(1); dc=v(2); tc=v(3); Tc=v(4);
+        uc=V*cos(ac); wc=V*sin(ac);
+        [q0x,q1x,q2x,q3x] = euler_to_quaternion(0,tc,0);
+        ctrl = struct('thrust',Tc,'delta_e',dc,'delta_a',0,'delta_r',0);
+        sv   = [uc;0;wc;0;q_req;0;q0x;q1x;q2x;q3x;0;0;-altitude];
+        sd   = F18_HARV_dynamics(0,sv,ctrl,aircraft);
+        qb   = 0.5*1.225*V^2;
+        Nz_c = qb*aircraft.aero.S_ref*aircraft.aero.CL_alpha*ac / (aircraft.mass*g);
+        ceq  = [uc*sd(1)+wc*sd(3);
+                sd(5);
+                Nz_c - n_target];
+        c    = [];
+    end
+    function val = cost4(v)
+        val = 1e-8*v(4)^2 + v(2)^2;
+    end
+end
+
+
+%% ----- 15-18.  HIGH-G TURN  (level or slicing) -------------------
+%  direction: +1 = left,  -1 = right
+%  gamma_deg: 0 = level,  < 0 = slicing (descending)
+%  Nz_target: 3–9 g
+%  Trim vars: [alpha, beta, de, da, dr, phi, theta, T]
+function md = generate_high_g_turn(V, Nz, direction, altitude, gamma_deg, aircraft, dt, duration)
+md = [];
+g       = 9.81;
+g_rad   = deg2rad(gamma_deg);
+phi_mag = acos(1/Nz);                              % required bank magnitude
+tr_rad  = direction * g*tan(phi_mag) / V;          % signed psi_dot
+
+% Adjust required CL for Nz and flight path angle
+qbar_0  = 0.5*1.225*V^2;
+CL_req  = Nz*aircraft.mass*g*cos(g_rad) / (qbar_0*aircraft.aero.S_ref);
+alpha_g = CL_req / aircraft.aero.CL_alpha;
+T_g     = qbar_0*aircraft.aero.S_ref*(aircraft.aero.CD0+aircraft.aero.k*CL_req^2) ...
+          + aircraft.mass*g*sin(g_rad);
+
+x0  = [alpha_g; 0; -deg2rad(2); 0; 0; direction*phi_mag; alpha_g+g_rad; max(500,T_g)];
+lb  = [deg2rad(-5);  deg2rad(-15); deg2rad(-24);  deg2rad(-25); deg2rad(-30); deg2rad(-89); deg2rad(-20); 500   ];
+ub  = [deg2rad(30);  deg2rad(15);  deg2rad(10.5); deg2rad(25);  deg2rad(30);  deg2rad(89);  deg2rad(35);  143200];
+opts = make_opts_iter('off');  % extra iterations for convergence
+
+[tv, ~, ef] = fmincon(@cost8, x0, [],[],[],[], lb,ub, @con8, opts);
+if ef <= 0
+    fprintf('    [FAIL] HighGTurn V=%.0f Nz=%.2f dir=%+d gamma=%.0f\n', V,Nz,direction,gamma_deg);
+    return;
+end
+[alpha,beta,de,da,dr,phi,theta,T] = unpack8(tv);
+[p,q,r] = body_rates(phi, theta, tr_rad);
+[q0c,q1c,q2c,q3c] = euler_to_quaternion(phi,theta,0);
+u=V*cos(alpha)*cos(beta); v=V*sin(beta); w=V*sin(alpha)*cos(beta);
+trim_s = [u;v;w;p;q;r;q0c;q1c;q2c;q3c;0;0;-altitude];
+trim_c = struct('thrust',T,'delta_e',de,'delta_a',da,'delta_r',dr);
+
+% Assign maneuver type string
+if abs(gamma_deg) < 0.5
+    type_str = 'high_g_turn_right'; if direction>0, type_str='high_g_turn_left'; end
+else
+    type_str = 'slice_turn_right';  if direction>0, type_str='slice_turn_left'; end
+end
+md = simulate_trim(trim_s, trim_c, type_str, duration, dt, aircraft);
+md.Nz = Nz;  md.phi_deg = rad2deg(phi);  md.gamma_deg = gamma_deg;
+fprintf('    [OK] %s  V=%.0f  Nz=%.2fg  phi=%.1fdeg\n', type_str, V, Nz, rad2deg(phi));
+
+    function [c,ceq] = con8(v)
+        [ac,bc,dc,dac,drc,phc,thc,Tc] = unpack8(v);
+        uc=V*cos(ac)*cos(bc); vc=V*sin(bc); wc=V*sin(ac)*cos(bc);
+        [pc,qc,rc] = body_rates(phc, thc, tr_rad);
+        [q0x,q1x,q2x,q3x] = euler_to_quaternion(phc,thc,0);
+        ctrl = struct('thrust',Tc,'delta_e',dc,'delta_a',dac,'delta_r',drc);
+        sv   = [uc;vc;wc;pc;qc;rc;q0x;q1x;q2x;q3x;0;0;-altitude];
+        sd   = F18_HARV_dynamics(0,sv,ctrl,aircraft);
+        % Bank balance: tan(phi) = V*tr_rad / (g*cos(gamma)) for climbing
+        phi_bal = tan(phc) - V*tr_rad/(g*max(cos(g_rad),0.05));
+        % Altitude / climb rate constraint
+        z_con   = sd(13) + V*sin(g_rad);   % = 0 for any gamma
+        ceq = [sd(1); sd(3); sd(4); sd(5); sd(6); z_con; bc; phi_bal];
+        c   = [];
+    end
+    function val = cost8(v)
+        val = 1e-8*v(8)^2 + v(3)^2 + 5*v(4)^2 + 5*v(5)^2 + 50*v(2)^2;
+    end
+end
+
+
+%% ===================================================================
+%  SHARED SIMULATION RUNNER
+%  Propagates from trim_state for `duration` seconds, storing each step.
+% ====================================================================
+function md = simulate_trim(trim_s, trim_c, type_str, duration, dt, aircraft)
+num_steps = ceil(duration / dt);
+traj_t    = (0:num_steps-1) * dt;
+traj_x    = zeros(13, num_steps);
+traj_u    = repmat([trim_c.thrust; trim_c.delta_e; trim_c.delta_a; trim_c.delta_r], 1, num_steps);
+cs        = trim_s;
+for i = 1:num_steps
+    traj_x(:,i) = cs;
+    cs = rk4_integrator(@F18_HARV_dynamics, 0, cs, dt, trim_c, aircraft);
+end
+md = struct('maneuver_type', type_str, ...
+            'trajectory_time', traj_t, ...
+            'trajectory_states', traj_x, ...
+            'trajectory_controls', traj_u, ...
+            'duration', duration, ...
+            'trim_state', trim_s, ...
+            'trim_controls', trim_c);
+end
+
+
+%% ===================================================================
+%  SHARED HELPERS
+% ====================================================================
+function [p,q,r] = body_rates(phi, theta, psi_dot)
+%BODY_RATES  Convert inertial turn rate psi_dot to body rates (p,q,r)
+%  assuming steady banked flight (phi_dot = theta_dot = 0).
+p = -psi_dot * sin(theta);
+q =  psi_dot * sin(phi) * cos(theta);
+r =  psi_dot * cos(phi) * cos(theta);
+end
+
+function [a,b,c,d,e,f,gh,h] = unpack8(v)
+%UNPACK8  Extract 8 trim variables.
+a=v(1);b=v(2);c=v(3);d=v(4);e=v(5);f=v(6);gh=v(7);h=v(8);
+end
+
+function opts = make_opts(disp)
+opts = optimoptions('fmincon','Display',disp,'Algorithm','sqp', ...
+    'MaxIterations',1000,'ConstraintTolerance',1e-7,'OptimalityTolerance',1e-6);
+end
+
+function opts = make_opts_iter(disp)
+opts = optimoptions('fmincon','Display',disp,'Algorithm','sqp', ...
+    'MaxIterations',2000,'ConstraintTolerance',1e-6,'OptimalityTolerance',1e-6);
+end
+
+
+%% ===================================================================
+%  FLIGHT DYNAMICS
+% ====================================================================
+function sd = F18_HARV_dynamics(~, state, ctrl, a)
+u=state(1); v=state(2); w=state(3);
+p=state(4); q=state(5); r=state(6);
+q0=state(7);q1=state(8);q2=state(9);q3=state(10);
+
+T=ctrl.thrust; de=ctrl.delta_e; da=ctrl.delta_a; dr=ctrl.delta_r;
+
+rho  = 1.225;
+V    = max(norm([u v w]), 1);
+qbar = 0.5*rho*V^2;
+alp  = atan2(w, u);
+bet  = asin(v / V);
+
+CL = a.aero.CL_alpha * alp;
+CD = a.aero.CD0 + a.aero.k*CL^2 + a.aero.k_alpha2*alp^2;
+CY = a.aero.CY_beta*bet + a.aero.CY_dr*dr;
+
+Lift  = qbar*a.aero.S_ref*CL;
+Drag  = qbar*a.aero.S_ref*CD;
+Yside = qbar*a.aero.S_ref*CY;
+
+Cwb = [cos(alp)*cos(bet),  sin(bet), sin(alp)*cos(bet);
+      -cos(alp)*sin(bet),  cos(bet),-sin(alp)*sin(bet);
+      -sin(alp),           0,        cos(alp)          ];
+Fb  = Cwb' * [T-Drag; Yside; -Lift];
+
+Rbi = [1-2*(q2^2+q3^2),   2*(q1*q2-q0*q3), 2*(q1*q3+q0*q2);
+        2*(q1*q2+q0*q3),  1-2*(q1^2+q3^2), 2*(q2*q3-q0*q1);
+        2*(q1*q3-q0*q2),  2*(q2*q3+q0*q1), 1-2*(q1^2+q2^2)];
+
+Fg = a.mass * (Rbi' * [0;0;9.81]);
+X=Fb(1)+Fg(1); Y=Fb(2)+Fg(2); Z=Fb(3)+Fg(3);
+
+u_d = X/a.mass + r*v - q*w;
+v_d = Y/a.mass + p*w - r*u;
+w_d = Z/a.mass + q*u - p*v;
+
+I3  = [a.Ixx,0,-a.Ixz; 0,a.Iyy,0; -a.Ixz,0,a.Izz];
+om  = [p;q;r];
+
+Cm = a.aero.Cm_alpha*alp + a.aero.Cm_q*(a.aero.c_bar/(2*V))*q + a.aero.Cm_delta_e*de;
+Cl = a.aero.Cl_beta*bet  + a.aero.Cl_p*(a.aero.b/(2*V))*p   + a.aero.Cl_r*(a.aero.b/(2*V))*r   + a.aero.Cl_delta_a*da + a.aero.Cl_delta_r*dr;
+Cn = a.aero.Cn_beta*bet  + a.aero.Cn_p*(a.aero.b/(2*V))*p   + a.aero.Cn_r*(a.aero.b/(2*V))*r   + a.aero.Cn_delta_a*da + a.aero.Cn_delta_r*dr;
+
+Lm = qbar*a.aero.S_ref*a.aero.b*Cl;
+Mm = qbar*a.aero.S_ref*a.aero.c_bar*Cm;
+Nm = qbar*a.aero.S_ref*a.aero.b*Cn;
+
+om_d = I3 \ ([Lm;Mm;Nm] - cross(om, I3*om));
+
+Om = [0,-p,-q,-r; p,0,r,-q; q,-r,0,p; r,q,-p,0];
+qd = 0.5 * Om * [q0;q1;q2;q3];
+
+vi = Rbi * [u;v;w];
+sd = [u_d; v_d; w_d; om_d; qd; vi];
+end
+
+
+%% ===================================================================
+%  RK4 INTEGRATOR
+% ====================================================================
+function yn = rk4_integrator(f, t, y, dt, u, p)
+k1 = f(t,        y,              u, p);
+k2 = f(t+0.5*dt, y+0.5*dt*k1,   u, p);
+k3 = f(t+0.5*dt, y+0.5*dt*k2,   u, p);
+k4 = f(t+dt,     y+dt*k3,        u, p);
+yn = y + (dt/6)*(k1+2*k2+2*k3+k4);
+q  = yn(7:10); yn(7:10) = q/norm(q);   % re-normalise quaternion
+end
+
+
+%% ===================================================================
+%  QUATERNION / EULER UTILITIES
+% ====================================================================
+function [q0,q1,q2,q3] = euler_to_quaternion(phi, theta, psi)
+cp=cos(phi/2);   sp=sin(phi/2);
+ct=cos(theta/2); st=sin(theta/2);
+cs=cos(psi/2);   ss=sin(psi/2);
+q0 = cp*ct*cs + sp*st*ss;
+q1 = sp*ct*cs - cp*st*ss;
+q2 = cp*st*cs + sp*ct*ss;
+q3 = cp*ct*ss - sp*st*cs;
+end
+
+function [phi,theta,psi] = quaternion_to_euler(q0,q1,q2,q3)
+phi   = atan2(2*(q0*q1+q2*q3), 1-2*(q1^2+q2^2));
+theta = asin( 2*(q0*q2-q3*q1));
+psi   = atan2(2*(q0*q3+q1*q2), 1-2*(q2^2+q3^2));
+end
+
+
+%% ===================================================================
+%  AIRCRAFT PARAMETERS  (F-18A / HARV, corrected values)
+% ====================================================================
+function a = get_f18_harv_parameters()
+% Mass & inertia (Chakraborty Table 2.1, slug·ft² → kg·m²)
+a.mass = 15096.5;
+a.Ixx  =  31183.6;
+a.Iyy  = 205127.5;
+a.Izz  = 230432.1;
+a.Ixz  =   4028.0;   % positive magnitude; tensor uses -Ixz
+
+% Reference geometry
+a.aero.S_ref  = 37.16;
+a.aero.c_bar  =  3.511;
+a.aero.b      = 11.404;
+
+% Lift (linear model, effective slope ~5 /rad)
+a.aero.CL_alpha = 5.0;
+
+% Drag
+a.aero.CD0      = 0.020;
+a.aero.k        = 0.080;
+a.aero.k_alpha2 = 0.300;   % alpha² drag rise term [/rad²]
+
+% Pitching moment
+a.aero.Cm_alpha   = -0.45;
+a.aero.Cm_q       = -4.50;
+a.aero.Cm_delta_e = -0.50;
+
+% Rolling moment
+a.aero.Cl_beta    = -0.080;
+a.aero.Cl_p       = -0.300;
+a.aero.Cl_r       =  0.050;
+a.aero.Cl_delta_a = -0.150;
+a.aero.Cl_delta_r =  0.050;
+
+% Yawing moment
+a.aero.Cn_beta    =  0.080;
+a.aero.Cn_p       = -0.030;
+a.aero.Cn_r       = -0.150;
+a.aero.Cn_delta_a = -0.010;
+a.aero.Cn_delta_r = -0.120;
+
+% Sideforce
+a.aero.CY_beta = -0.730;
+a.aero.CY_dr   =  0.200;
+
+% Control limits (FA-18A, stored for OCP bound reference)
+a.ctrl.delta_e_min = deg2rad(-24.0);
+a.ctrl.delta_e_max = deg2rad( 10.5);
+a.ctrl.delta_a_min = deg2rad(-25.0);
+a.ctrl.delta_a_max = deg2rad( 45.0);
+a.ctrl.delta_r_min = deg2rad(-30.0);
+a.ctrl.delta_r_max = deg2rad( 30.0);
+a.ctrl.thrust_min  = 500;
+a.ctrl.thrust_max  = 143200;
+end
+
+
+%% ===================================================================
+%  PLOTTER — one figure per manoeuvre type
+% ====================================================================
+function plot_all_maneuvers(ml)
+groups = containers.Map('KeyType','char','ValueType','any');
+for i = 1:numel(ml)
+    m = ml{i};
+    if ~isfield(m,'maneuver_type'), continue; end
+    t = m.maneuver_type;
+    if isKey(groups,t), groups(t)=[groups(t),{m}]; else, groups(t)={m}; end
+end
+types = keys(groups);
+fprintf('\nPlotting %d manoeuvre types...\n', numel(types));
+
+for k = 1:numel(types)
+    t   = types{k};
+    grp = groups(t);
+    nm  = numel(grp);
+    figure('Name',['Trajectories: ' strrep(t,'_',' ')],'Color','w');
+    hold on; grid on; axis equal;
+    xlabel('X North [m]'); ylabel('Y East [m]'); zlabel('Altitude [m]');
+    title(['Trajectories: ' strrep(t,'_',' ')]);
+    view(30,20);
+    clrs = jet(max(1,nm));
+    for i = 1:nm
+        m = grp{i};
+        if ~isfield(m,'trajectory_states'), continue; end
+        st = m.trajectory_states;
+        if isempty(st) || size(st,1)<13, continue; end
+        X = st(11,:); Y = st(12,:); Alt = -st(13,:);
+        cc = clrs(i,:);
+        plot3(X,Y,Alt,'Color',cc,'LineWidth',1.5,'DisplayName',sprintf('Case %d',i));
+        plot3(X(1),  Y(1),  Alt(1),  'o','MarkerEdgeColor','k','MarkerFaceColor',cc,'MarkerSize',4);
+        plot3(X(end),Y(end),Alt(end),'s','MarkerEdgeColor','k','MarkerFaceColor',cc,'MarkerSize',6);
+    end
+    hold off;
+    fprintf('  → %s  (%d trajectories)\n', t, nm);
+end
+fprintf('✅ Plotting complete.\n');
+end
